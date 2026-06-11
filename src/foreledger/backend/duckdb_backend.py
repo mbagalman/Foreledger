@@ -163,7 +163,19 @@ class DuckDBBackend(Backend):
                 f"(e.g. {missing[0]!r}); raw archive data was deleted or modified "
                 "externally"
             )
-        return [(self.store / name).as_posix() for name in segments]
+        # defense in depth behind token validation: even a symlinked segment
+        # must resolve inside the archive root
+        root = self.store.resolve()
+        files = []
+        for name in segments:
+            resolved = (self.store / name).resolve()
+            if not resolved.is_relative_to(root):
+                raise StoreFormatError(
+                    f"segment {name!r} resolves outside the archive store; the "
+                    "store is corrupt or was tampered with"
+                )
+            files.append(resolved.as_posix())
+        return files
 
     def read_actuals(self, segments: Sequence[str]) -> pd.DataFrame:
         files = self._segment_files(segments)

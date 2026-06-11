@@ -1,9 +1,9 @@
 # Foreledger quick-start guide
 
 This walkthrough takes you from an empty directory to accuracy curves, model
-comparisons, and as-of replays in about ten minutes. The snippets form one
-continuous session: paste them into a Python REPL or script top to bottom and
-every one runs as written.
+comparisons, and origin-scoped snapshots in about ten minutes. The snippets
+form one continuous session: paste them into a Python REPL or script top to
+bottom and every one runs as written.
 
 For the elevator pitch and architecture overview, see the [README](../README.md).
 
@@ -38,10 +38,14 @@ Two safety properties worth knowing from the start:
 
 - Foreledger **never re-initializes** an existing non-archive directory; it
   raises `StoreFormatError` instead of touching your files.
-- The archive carries a **format version** (currently 2; version-1 stores
-  migrate automatically on open). A store written by a newer Foreledger
-  raises a clear error rather than being misread — which also means an older
-  library refuses a newer store instead of silently misinterpreting it.
+- The archive carries a **format version** (currently 3; version-1 and -2
+  stores migrate automatically on open). Format 3 makes the visibility and
+  integrity metadata (`runs.json`, `actuals_manifest.json`,
+  `segment_integrity.json`) mandatory — a missing or tampered one is a typed
+  corruption error, never silent emptiness. The rollback boundary: once a
+  store migrates, older Foreledger versions refuse it with a clear error
+  rather than misreading it, just as this version refuses stores written by
+  a newer one.
 
 ## 3. Ingest forecast runs
 

@@ -19,6 +19,15 @@ Fingerprints adopt only during the format migration; recovering after
 intentional external surgery means updating the registry entries by hand
 (and deleting the summary so it rebuilds), deliberately not a casual
 operation.
+
+The registry doubles as the durable commit journal: entries are written
+``committed: false`` (staged) before a visibility commit and flipped to
+``committed: true`` right after it. That distinction is what lets open-time
+maintenance prune the orphans of failed writes while treating a *committed*
+fingerprint that the mutable manifests no longer reference as corruption —
+editing ``runs.json``/``actuals_manifest.json`` can never silently erase
+committed history. (Entries from older format-3 stores lack the flag and are
+normalized on first open.)
 """
 
 from __future__ import annotations

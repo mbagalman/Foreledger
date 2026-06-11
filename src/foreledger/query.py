@@ -68,8 +68,7 @@ class Evaluator:
     def __init__(
         self,
         backend: Backend,
-        active_run_ids: Callable[[], list[str]],
-        forecast_segments: Callable[[], list[str]],
+        forecast_visibility: Callable[[], tuple[list[str], list[str]]],
         registry: MetricRegistry,
         source_priority: list[str] | None,
         champions: Callable[[], dict[str, str]],
@@ -79,10 +78,10 @@ class Evaluator:
         integrity_check: Callable[[], None],
     ) -> None:
         self._backend = backend
-        self._active_run_ids = active_run_ids
-        # the manifest is the single visibility point: forecast scans cover
-        # exactly the committed active segments, never the directory
-        self._forecast_segments = forecast_segments
+        # the manifest is the single visibility point: active run ids and
+        # the committed segments to scan come from ONE snapshot of it, so a
+        # concurrent overwrite yields the before or after view, never a mix
+        self._forecast_visibility = forecast_visibility
         self._registry = registry
         self._source_priority = source_priority
         self._champions = champions
@@ -114,9 +113,10 @@ class Evaluator:
         start, end = _parse_period(period)
         if origin_max is not None:
             end = origin_max if end is None else min(end, origin_max)
+        run_ids, segments = self._forecast_visibility()
         flt = ForecastFilter(
-            active_run_ids=self._active_run_ids(),
-            segments=self._forecast_segments(),
+            active_run_ids=run_ids,
+            segments=segments,
             model_id=model_id,
             model_version=model_version,
             series=_series_list(series),

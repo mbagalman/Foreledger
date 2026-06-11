@@ -392,6 +392,147 @@ def test_v2_store_migrates_and_rebless_invalidates_summary(store: Path) -> None:
     assert meta["format_version"] == FORMAT_VERSION
 
 
+def test_truncated_but_valid_manifest_is_detected(store: Path) -> None:
+    """Review reproduction: a valid-looking manifest that stopped referencing
+    committed history is corruption — the committed fingerprint is the
+    durable journal and is never silently pruned."""
+    _populated(store)
+    integrity_before = (store / "segment_integrity.json").read_text(encoding="utf-8")
+
+    # rewrite runs.json as a valid empty manifest
+    (store / "runs.json").write_text('{"runs": []}', encoding="utf-8")
+    with pytest.raises(StoreFormatError, match="no longer references"):
+        ForecastArchive(store)
+    assert (store / "segment_integrity.json").read_text(encoding="utf-8") == integrity_before
+
+
+def test_truncated_actuals_manifest_is_detected(store: Path) -> None:
+    archive = _populated(store)
+    assert archive.accuracy_at_horizon(1, model_id="alpha", model_version="v1").status == "ok"
+
+    manifest_path = store / "actuals_manifest.json"
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["actuals"] = []  # drop the committed actuals reference
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    # detected on the live handle and on reopen
+    with pytest.raises(StoreFormatError, match="no longer references"):
+        archive.accuracy_at_horizon(1, model_id="alpha", model_version="v1")
+    with pytest.raises(StoreFormatError, match="no longer references"):
+        ForecastArchive(store)
+
+
+def test_corrupt_store_fails_writes_before_any_side_effect(store: Path) -> None:
+    """Review reproduction: a write into a store with corrupt committed state
+    must fail before its first durable side effect — never commit and then
+    report failure."""
+    archive = _populated(store)
+    runs_before = (store / "runs.json").read_text(encoding="utf-8")
+    actuals_manifest_before = (store / "actuals_manifest.json").read_text(encoding="utf-8")
+
+    # corrupt the committed state: delete a committed forecast segment
+    runs = json.loads(runs_before)
+    (store / runs["runs"][0]["segment"]).unlink()
+
+    extra = pd.DataFrame(
+        {
+            "series_id": ["S9"],
+            "target": [pd.Timestamp("2026-03-01")],
+            "value": [1.0],
+        }
+    )
+    with pytest.raises(StoreFormatError, match="missing"):
+        archive.register_actuals(extra, recorded_at="2026-03-02")
+    with pytest.raises(StoreFormatError, match="missing"):
+        archive.ingest(forecast_frame(2.0), model_id="beta", model_version="v1")
+    # nothing was committed by the failed calls
+    assert (store / "actuals_manifest.json").read_text(encoding="utf-8") == (
+        actuals_manifest_before
+    )
+    assert (store / "runs.json").read_text(encoding="utf-8") == runs_before
+
+
+def test_deleted_registry_fails_writes_without_recreating_it(store: Path) -> None:
+    archive = _populated(store)
+    (store / "segment_integrity.json").unlink()
+    with pytest.raises(StoreFormatError, match="integrity registry"):
+        archive.ingest(forecast_frame(2.0), model_id="beta", model_version="v1")
+    # the write path never recreates the mandatory registry
+    assert not (store / "segment_integrity.json").exists()
+
+
+def test_legacy_migration_rejects_path_traversal_tokens(tmp_path: Path) -> None:
+    """Review reproduction: a tampered legacy record must not make the
+    migration read Parquet files outside the archive."""
+    store = tmp_path / "store"
+    ForecastArchive(store)
+    outside = tmp_path / "outside.parquet"
+    forecast_frame(1.0).assign(
+        model_id="alpha",
+        model_version="v1",
+        horizon=1,
+        run_id="evil",
+        ingested_at=pd.Timestamp("2026-06-01"),
+    ).to_parquet(outside, index=False)
+    legacy = {
+        "runs": [
+            {
+                "run_id": "evil",
+                "model_id": "alpha",
+                "model_version": "v1",
+                "origin": "2026-01-01T00:00:00",
+                "series_key": "x",
+                "content_hash": "legacy",
+                "segment": "../outside.parquet",
+                "ingested_at": "2026-06-01T00:00:00",
+                "superseded": False,
+            }
+        ]
+    }
+    (store / "runs.json").write_text(json.dumps(legacy), encoding="utf-8")
+    with pytest.raises(StoreFormatError, match="segment token"):
+        ForecastArchive(store)
+    assert outside.exists()  # untouched
+
+
+def test_open_verifies_committed_segments(store: Path) -> None:
+    """The documented contract: a corrupt store raises on open, not on the
+    first unlucky query."""
+    _populated(store)
+    runs = json.loads((store / "runs.json").read_text(encoding="utf-8"))
+    (store / runs["runs"][0]["segment"]).unlink()
+    with pytest.raises(StoreFormatError, match="missing"):
+        ForecastArchive(store)
+
+
+def test_concurrent_overwrite_never_yields_phantom_empty_view(
+    store: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review reproduction: a read interleaved with another handle's
+    overwrite must see the before or after view, never a combination (old
+    run ids + new segments) that never existed."""
+    frame = forecast_frame(1.0)
+    handle_a = ForecastArchive(store)
+    handle_a.ingest(frame, model_id="alpha", model_version="v1")
+    handle_b = ForecastArchive(store)
+
+    original = handle_a._current_manifest
+    fired = {"done": False}
+
+    def interleaved():  # type: ignore[no-untyped-def]
+        manifest = original()
+        if not fired["done"]:
+            fired["done"] = True
+            changed = frame.copy()
+            changed["value"] = changed["value"] + 1.0
+            handle_b.ingest(changed, model_id="alpha", model_version="v1", on_conflict="overwrite")
+        return manifest
+
+    monkeypatch.setattr(handle_a, "_current_manifest", interleaved)
+    rows = handle_a.as_of("2100-01-01")
+    assert len(rows) == len(frame)  # the before or after view — never empty
+
+
 def test_deleting_manifest_on_a_live_handle_is_a_typed_error(store: Path) -> None:
     """Review reproduction: a live handle must treat a deleted mandatory
     manifest exactly like reopen does — typed corruption, never an

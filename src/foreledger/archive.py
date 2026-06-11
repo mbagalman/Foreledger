@@ -50,6 +50,7 @@ from .ingestion import (
     content_hash,
     load_manifest_entries,
     plan_runs,
+    validate_forecast_segment_token,
 )
 from .integrity import SegmentIntegrity
 from .locking import StoreLock
@@ -131,7 +132,10 @@ class ForecastArchive:
             if stored_version < FORMAT_VERSION:
                 self._migrate_to_v3()
             else:
-                self._prune_integrity_records()
+                self._reconcile_integrity_records()
+            # the documented open contract: a corrupt store raises here, not
+            # on the first unlucky query (cheap stat probe; reconcile() hashes)
+            self._verify_committed_segments()
         self._champions_path = self.store / "champions.json"
         self._conflicts_logged_path = self.store / "conflicts_logged.json"
         self._error_log = (
@@ -141,9 +145,9 @@ class ForecastArchive:
         self._registry = MetricRegistry(timeout=metric_timeout)
         self._evaluator = Evaluator(
             backend=self._backend,
-            # late-bound and freshness-checked: reads see other handles' commits
-            active_run_ids=lambda: self._current_manifest().active_run_ids(),
-            forecast_segments=self._active_forecast_segments,
+            # late-bound and freshness-checked: reads see other handles'
+            # commits, and run ids + segments come from one manifest snapshot
+            forecast_visibility=self._forecast_visibility,
             registry=self._registry,
             source_priority=self._source_priority,
             champions=self.champions,
@@ -369,8 +373,13 @@ class ForecastArchive:
         adopted = 0
         for token in tokens:
             if token not in registry.entries:
-                registry.entries[token] = self._backend.fingerprint_segment(token)
+                registry.entries[token] = {
+                    **self._backend.fingerprint_segment(token),
+                    "committed": True,
+                }
                 adopted += 1
+            else:
+                registry.entries[token]["committed"] = True
         for stale in set(registry.entries) - set(tokens):
             del registry.entries[stale]
         registry.save()
@@ -404,7 +413,7 @@ class ForecastArchive:
         """
         legacy = [e for e in entries if "series_key" in e]
         modern = [e for e in entries if "series_key" not in e]
-        required = ("run_id", "model_id", "model_version", "origin", "ingested_at")
+        required = ("run_id", "model_id", "model_version", "origin", "ingested_at", "segment")
         for entry in legacy:
             missing = [key for key in required if key not in entry]
             if missing:
@@ -412,6 +421,10 @@ class ForecastArchive:
                     f"legacy run manifest record is missing fields {missing}; the "
                     "manifest may be corrupt or written by an incompatible version"
                 )
+            # same canonical-token rule as modern records, BEFORE any backend
+            # access: a tampered legacy manifest must not be able to make the
+            # migration read Parquet files outside the archive
+            validate_forecast_segment_token(str(entry["segment"]), self._manifest_path)
         records = RunManifest.from_entries(self._manifest_path, modern).runs
 
         migrated: list[RunRecord] = []
@@ -448,7 +461,7 @@ class ForecastArchive:
             )
             for record in migrated:
                 record.segment = segment
-            self._record_segment_integrity([segment])
+            self._record_segment_integrity([segment], committed=True, create_if_missing=True)
 
         manifest = RunManifest(path=self._manifest_path, runs=[*records, *migrated])
         manifest.save()
@@ -504,6 +517,9 @@ class ForecastArchive:
         """
         canonical = canonicalize_forecasts(frame, mapping, model_id, model_version, origin)
         with self._lock():
+            # strict preflight: never commit new data into a store whose
+            # existing committed state is already corrupt
+            self._verify_committed_segments()
             # plan against a fresh snapshot so concurrent handles merge
             # instead of clobbering each other's committed runs
             self._manifest = RunManifest.load(self._manifest_path)
@@ -517,17 +533,24 @@ class ForecastArchive:
                 return IngestResult(
                     n_rows=0, n_runs_written=0, n_runs_skipped=skipped, n_runs_superseded=0
                 )
+            staged: list[str] = []
+
+            def record_staged(tokens: Sequence[str]) -> None:
+                self._record_segment_integrity(tokens)
+                staged.extend(tokens)
+
             result, committed = commit_runs(
                 planned,
                 self._manifest,
                 self._backend.write_forecast_segment,
                 now=pd.Timestamp.now(),
-                record_integrity=self._record_segment_integrity,
+                record_integrity=record_staged,
             )
             # swap only after the durable save succeeded; a failed commit
             # leaves this handle's view at its pre-call state
             self._manifest = committed
             self._manifest_key = self._manifest_file_key()
+            self._mark_segments_committed(staged)
         self._refresh_summary_after_write()
         return dataclasses.replace(result, n_runs_skipped=skipped)
 
@@ -606,6 +629,9 @@ class ForecastArchive:
         """
         batch = canonicalize_actuals(frame, mapping, source, recorded_at, official)
         with self._lock():
+            # strict preflight: never commit new data into a store whose
+            # existing committed state is already corrupt
+            self._verify_committed_segments()
             manifest = self._current_actuals_manifest()
             existing = self._backend.read_actuals(manifest.actuals)
             # All deterministic validation happens first, before any durable
@@ -669,14 +695,14 @@ class ForecastArchive:
                 if designations is not None
                 else None
             )
-            self._record_segment_integrity(
-                [token for token in (actuals_segment, officials_segment) if token]
-            )
+            staged = [token for token in (actuals_segment, officials_segment) if token]
+            self._record_segment_integrity(staged)
 
             committed = manifest.extended(actuals_segment, officials_segment)
             committed.save()
             self._actuals_manifest = committed
             self._actuals_key = self._actuals_manifest_file_key()
+            self._mark_segments_committed(staged)
             logger.info(
                 "registered %d actual(s)%s", len(new_rows), " as official" if official else ""
             )
@@ -708,6 +734,9 @@ class ForecastArchive:
         """
         validate_source_label(source)
         with self._lock():
+            # strict preflight: never commit new data into a store whose
+            # existing committed state is already corrupt
+            self._verify_committed_segments()
             manifest = self._current_actuals_manifest()
             actuals = self._backend.read_actuals(manifest.actuals)
             row = find_actual_row(actuals, series, target, source, recorded_at)
@@ -726,6 +755,7 @@ class ForecastArchive:
             committed.save()
             self._actuals_manifest = committed
             self._actuals_key = self._actuals_manifest_file_key()
+            self._mark_segments_committed([segment])
         logger.info("official designation recorded")
         self._refresh_summary_after_write()
 
@@ -758,11 +788,9 @@ class ForecastArchive:
     # -- summary maintenance -------------------------------------------------
 
     def _raw_state(self) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        run_ids, segments = self._forecast_visibility()
         forecasts = self._backend.read_forecasts(
-            ForecastFilter(
-                active_run_ids=self._current_manifest().active_run_ids(),
-                segments=self._active_forecast_segments(),
-            )
+            ForecastFilter(active_run_ids=run_ids, segments=segments)
         )
         return forecasts, self._visible_actuals(), self._visible_officials()
 
@@ -809,6 +837,20 @@ class ForecastArchive:
             }
         )
 
+    def _forecast_visibility(self) -> tuple[list[str], list[str]]:
+        """Active (run_ids, segment tokens) from ONE manifest snapshot.
+
+        Deriving the pair from two separate freshness-checked reads could
+        interleave with another handle's overwrite and combine old run ids
+        with new segments — a view that never existed.
+        """
+        manifest = self._current_manifest()
+        run_ids = manifest.active_run_ids()
+        segments = sorted(
+            {run.segment for run in manifest.runs if not run.superseded and run.segment}
+        )
+        return run_ids, segments
+
     def _referenced_tokens(self) -> list[str]:
         """Every segment referenced by any record — including superseded
         history. The archive is append-only: superseded runs leave the active
@@ -822,31 +864,74 @@ class ForecastArchive:
             | set(actuals_manifest.officials)
         )
 
-    def _prune_integrity_records(self) -> None:
-        """Drop fingerprints for segments referenced by nothing (the invisible
-        leftovers of failed commits). Prune-only: at format 3 a referenced
-        segment without a fingerprint is corruption, never something to
-        silently adopt. Caller holds the store lock."""
+    def _reconcile_integrity_records(self) -> None:
+        """Open-time journal reconciliation. Caller holds the store lock.
+
+        Three-way rule per registry entry:
+        - referenced by a manifest → it was committed; ensure the flag says so
+          (repairs the crash window between a manifest save and the flip);
+        - unreferenced and staged → the orphan of a failed write: prune;
+        - unreferenced and *committed* → the mutable manifests stopped
+          referencing committed history: corruption, never a prune. A
+          valid-looking but truncated ``runs.json``/``actuals_manifest.json``
+          can therefore never silently erase committed data.
+
+        Entries without the flag (older format-3 stores) are normalized:
+        referenced ones become committed, unreferenced ones prune as the old
+        semantics did.
+        """
         registry = SegmentIntegrity.load(self._integrity_path)
-        stale = set(registry.entries) - set(self._referenced_tokens())
-        if stale:
-            for token in stale:
+        referenced = set(self._referenced_tokens())
+        changed = False
+        for token, record in list(registry.entries.items()):
+            flag = record.get("committed")
+            if token in referenced:
+                if flag is not True:
+                    record["committed"] = True
+                    changed = True
+            elif flag is True:
+                raise StoreFormatError(
+                    f"visibility metadata no longer references committed segment "
+                    f"{token!r}; runs.json or actuals_manifest.json was modified "
+                    "externally"
+                )
+            else:
                 del registry.entries[token]
+                changed = True
+        if changed:
             registry.save()
 
-    def _record_segment_integrity(self, tokens: Sequence[str]) -> None:
+    def _record_segment_integrity(
+        self, tokens: Sequence[str], *, committed: bool = False, create_if_missing: bool = False
+    ) -> None:
         """Fingerprint freshly written segments — called inside the store
-        lock, after the segment write and before the visibility commit, so a
-        committed segment always has its fingerprint on record."""
+        lock, after the segment write and before the visibility commit
+        (staged), then flipped via :meth:`_mark_segments_committed` once the
+        commit succeeds. ``create_if_missing`` is reserved for migrations; at
+        format 3 a missing registry is corruption, never something a write
+        path may recreate."""
         if not tokens:
             return
-        registry = (
-            SegmentIntegrity.load(self._integrity_path)
-            if self._integrity_path.exists()
-            else SegmentIntegrity(path=self._integrity_path)  # mid-migration only
-        )
+        if create_if_missing and not self._integrity_path.exists():
+            registry = SegmentIntegrity(path=self._integrity_path)
+        else:
+            registry = SegmentIntegrity.load(self._integrity_path)
         for token in tokens:
-            registry.entries[token] = self._backend.fingerprint_segment(token)
+            registry.entries[token] = {
+                **self._backend.fingerprint_segment(token),
+                "committed": committed,
+            }
+        registry.save()
+
+    def _mark_segments_committed(self, tokens: Sequence[str]) -> None:
+        """Flip staged journal entries to committed, right after the
+        visibility commit succeeded (still under the store lock)."""
+        if not tokens:
+            return
+        registry = SegmentIntegrity.load(self._integrity_path)
+        for token in tokens:
+            if token in registry.entries:
+                registry.entries[token]["committed"] = True
         registry.save()
 
     def _verify_committed_segments(self) -> None:
@@ -881,6 +966,29 @@ class ForecastArchive:
                 f"{len(modified)} committed segment(s) do not match their recorded "
                 f"integrity fingerprint (e.g. {modified[0]!r}); raw archive data was "
                 "modified externally"
+            )
+        referenced_set = set(referenced)
+        orphaned = [
+            token
+            for token, record in registry.entries.items()
+            if record.get("committed") is True and token not in referenced_set
+        ]
+        if orphaned:
+            # Maybe a benign race rather than corruption: a concurrent writer
+            # flips an entry to committed only AFTER its manifest save, so a
+            # fresh manifest read must reference it. Only a persistent orphan
+            # is a truncated/tampered manifest.
+            self._manifest = RunManifest.load(self._manifest_path)
+            self._manifest_key = self._manifest_file_key()
+            self._actuals_manifest = ActualsManifest.load(self._actuals_manifest_path)
+            self._actuals_key = self._actuals_manifest_file_key()
+            referenced_set = set(self._referenced_tokens())
+            orphaned = [token for token in orphaned if token not in referenced_set]
+        if orphaned:
+            raise StoreFormatError(
+                f"visibility metadata no longer references committed segment "
+                f"{orphaned[0]!r}; runs.json or actuals_manifest.json was modified "
+                "externally"
             )
 
     def _valid_summary(self) -> pd.DataFrame | None:

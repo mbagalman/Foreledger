@@ -60,6 +60,18 @@ class RunRecord:
 _FORECAST_SEGMENT_PATTERN = re.compile(r"^forecasts/[A-Za-z0-9._-]+\.parquet$")
 
 
+def validate_forecast_segment_token(token: str, manifest_path: Path) -> None:
+    """Reject any forecast segment token that is not a canonical relative
+    path — absolute paths and traversal are corruption, never resolved."""
+    from .errors import StoreFormatError
+
+    if not _FORECAST_SEGMENT_PATTERN.match(token):
+        raise StoreFormatError(
+            f"run manifest at {manifest_path} holds an invalid segment token "
+            f"{token!r}; the manifest is corrupt or was tampered with"
+        )
+
+
 def load_manifest_entries(path: Path) -> list[dict[str, Any]]:
     """Raw manifest entries, with corruption surfaced as a typed error.
 
@@ -106,11 +118,7 @@ class RunManifest:
         for run in runs:
             # canonical relative tokens only: a tampered manifest must not be
             # able to point forecast reads at files outside the archive
-            if not _FORECAST_SEGMENT_PATTERN.match(run.segment):
-                raise StoreFormatError(
-                    f"run manifest at {path} holds an invalid segment token "
-                    f"{run.segment!r}; the manifest is corrupt or was tampered with"
-                )
+            validate_forecast_segment_token(run.segment, path)
         return cls(path=path, runs=runs)
 
     @classmethod
