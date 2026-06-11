@@ -403,6 +403,69 @@ def test_invalid_source_priority_entries_rejected(store: Path, bad_entry: object
         ForecastArchive(store, source_priority=["feed", bad_entry])  # type: ignore[list-item]
 
 
+def test_failed_visibility_commit_leaves_no_conflict_audit_entries(
+    archive: ForecastArchive, store: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review reproduction: audit entries are written only after the
+    visibility commit — a registration that never became visible must not be
+    described as a durable ambiguity."""
+    setup_forecasts(archive)
+    ts = "2026-02-01T12:00:00"
+    archive.register_actuals(one_target_frame(100.0), source="a", recorded_at=ts)
+
+    def failing_save(self: object) -> None:
+        raise OSError("simulated crash at the visibility commit")
+
+    monkeypatch.setattr("foreledger.actuals.ActualsManifest.save", failing_save)
+    with pytest.raises(OSError):
+        archive.register_actuals(one_target_frame(110.0), source="b", recorded_at=ts)
+    monkeypatch.undo()
+
+    # no entries, no dedup marker — the ambiguity never existed in the archive
+    error_log = store / "error_log.txt"
+    assert not error_log.exists() or "ambiguous-latest" not in error_log.read_text(encoding="utf-8")
+    assert not (store / "conflicts_logged.json").exists()
+    assert mae_at_h1(archive).status == "ok"
+
+    # the successful retry commits the conflict AND its audit entry
+    archive.register_actuals(one_target_frame(110.0), source="b", recorded_at=ts)
+    assert "ambiguous-latest" in error_log.read_text(encoding="utf-8")
+    assert mae_at_h1(archive).status == "insufficient"
+
+
+def test_post_commit_audit_failure_is_typed_and_self_heals(
+    archive: ForecastArchive, store: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the audit write fails after the data committed, the caller gets a
+    typed partial-commit error and the next registration writes the entry."""
+    from foreledger import ConflictLogError
+
+    setup_forecasts(archive)
+    ts = "2026-02-01T12:00:00"
+    archive.register_actuals(one_target_frame(100.0), source="a", recorded_at=ts)
+
+    def failing_write(conflicts: object) -> None:
+        raise OSError("simulated audit write failure")
+
+    monkeypatch.setattr(archive, "_write_conflict_records", failing_write)
+    with pytest.raises(ConflictLogError):
+        archive.register_actuals(one_target_frame(110.0), source="b", recorded_at=ts)
+    monkeypatch.undo()
+
+    # the data is durable and visible (the target is now ambiguous)
+    assert mae_at_h1(archive).status == "insufficient"
+    # ... and the next successful registration writes the missed entry
+    other_target = pd.DataFrame(
+        {
+            "series_id": ["S1"],
+            "target": [ORIGINS[0] + pd.Timedelta(days=2)],
+            "value": [50.0],
+        }
+    )
+    archive.register_actuals(other_target, source="a", recorded_at="2026-02-02")
+    assert "ambiguous-latest" in (store / "error_log.txt").read_text(encoding="utf-8")
+
+
 def test_rejected_official_conflict_leaves_audit_files_untouched(
     archive: ForecastArchive, store: Path
 ) -> None:

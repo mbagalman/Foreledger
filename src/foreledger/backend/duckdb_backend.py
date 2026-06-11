@@ -9,6 +9,7 @@ crashed ingest leaves the archive at its pre-run state.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -134,6 +135,22 @@ class DuckDBBackend(Backend):
 
     def missing_segments(self, segments: Sequence[str]) -> list[str]:
         return [name for name in segments if not (self.store / name).exists()]
+
+    def stat_segments(self, segments: Sequence[str]) -> dict[str, tuple[int, int]]:
+        stats: dict[str, tuple[int, int]] = {}
+        for name in segments:
+            try:
+                stat = (self.store / name).stat()
+            except FileNotFoundError:
+                continue
+            stats[name] = (stat.st_size, stat.st_mtime_ns)
+        return stats
+
+    def fingerprint_segment(self, segment: str) -> dict[str, Any]:
+        path = self.store / segment
+        stat = path.stat()
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns, "sha256": digest}
 
     def _segment_files(self, segments: Sequence[str]) -> list[str]:
         # A committed segment that is gone is corruption, never a skip: the

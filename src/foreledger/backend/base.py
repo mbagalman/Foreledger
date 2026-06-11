@@ -145,6 +145,16 @@ class Backend(ABC):
         error, never as silently absent rows or a stale summary."""
 
     @abstractmethod
+    def stat_segments(self, segments: Sequence[str]) -> dict[str, tuple[int, int]]:
+        """(size, mtime_ns) per existing segment token (missing ones omitted).
+        The cheap per-query integrity probe."""
+
+    @abstractmethod
+    def fingerprint_segment(self, segment: str) -> dict[str, Any]:
+        """{"size", "mtime_ns", "sha256"} of a stored segment — recorded at
+        commit time and verified in full by ``reconcile()``."""
+
+    @abstractmethod
     def read_summary(self) -> tuple[pd.DataFrame, str] | None:
         """Read the stored summary and its raw-state token, or None if absent
         (the summary is always rebuildable from raw)."""

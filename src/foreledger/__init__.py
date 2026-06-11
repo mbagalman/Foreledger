@@ -15,6 +15,7 @@ architecture decisions (ADR-001..007) and the phased plan.
 
 from .archive import ForecastArchive
 from .errors import (
+    ConflictLogError,
     ForecastArchiveError,
     IngestConflictError,
     OfficialConflictError,
@@ -34,6 +35,7 @@ __all__ = [
     "FORMAT_VERSION",
     "AccuracyCurve",
     "AccuracyResult",
+    "ConflictLogError",
     "ForecastArchive",
     "ForecastArchiveError",
     "IngestConflictError",

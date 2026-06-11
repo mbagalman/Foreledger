@@ -25,6 +25,7 @@ import pandas as pd
 
 from .actuals import (
     ActualsManifest,
+    Conflict,
     canonicalize_actuals,
     check_official_registration,
     dedup_against_log,
@@ -34,7 +35,12 @@ from .actuals import (
     validate_source_label,
 )
 from .backend import Backend, ForecastFilter, create_backend
-from .errors import ReconciliationError, StoreFormatError, ValidationError
+from .errors import (
+    ConflictLogError,
+    ReconciliationError,
+    StoreFormatError,
+    ValidationError,
+)
 from .ingestion import (
     IngestResult,
     RunManifest,
@@ -45,6 +51,7 @@ from .ingestion import (
     load_manifest_entries,
     plan_runs,
 )
+from .integrity import SegmentIntegrity
 from .locking import StoreLock
 from .metrics import DEFAULT_METRIC_TIMEOUT, MetricFn, MetricRegistry
 from .query import Evaluator, Period
@@ -112,11 +119,13 @@ class ForecastArchive:
         self._manifest_path = self.store / "runs.json"
         self._manifest = self._load_manifest()
         self._manifest_key = self._manifest_file_key()
+        self._integrity_path = self.store / "segment_integrity.json"
         with self._lock():
             if needs_v1_migration:
                 self._migrate_v1_actuals_visibility()
             self._actuals_manifest = self._load_actuals_manifest()
-        self._actuals_key = self._actuals_manifest_file_key()
+            self._actuals_key = self._actuals_manifest_file_key()
+            self._ensure_integrity_records()
         self._champions_path = self.store / "champions.json"
         self._conflicts_logged_path = self.store / "conflicts_logged.json"
         self._error_log = (
@@ -178,11 +187,18 @@ class ForecastArchive:
             return None
         try:
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            return int(meta["format_version"])
-        except (ValueError, KeyError, json.JSONDecodeError) as exc:
+            raw = meta["format_version"]
+        except (KeyError, json.JSONDecodeError) as exc:
             raise StoreFormatError(
                 f"archive metadata at {meta_path} is unreadable or corrupt"
             ) from exc
+        # strict: booleans are ints in Python, "1" is not a version
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            raise StoreFormatError(
+                f"archive metadata at {meta_path} declares a non-integer format "
+                f"version {raw!r}; the store is corrupt"
+            )
+        return int(raw)
 
     def _write_format_version(self, version: int) -> None:
         meta_path = self.store / _META_FILE
@@ -205,13 +221,22 @@ class ForecastArchive:
         self._refuse_non_archive_dir()
         stored_version = self._stored_format_version()
         if stored_version is not None:
+            if stored_version == FORMAT_VERSION:
+                return False
             if stored_version > FORMAT_VERSION:
                 raise StoreFormatError(
                     f"archive format version {stored_version} is newer than this "
                     f"library supports ({FORMAT_VERSION}); upgrade foreledger "
                     "to open this store"
                 )
-            return stored_version < FORMAT_VERSION
+            if stored_version == 1:
+                return True
+            # only version 1 has a defined migration; anything else older is
+            # an unknown layout we must not reinterpret or rewrite
+            raise StoreFormatError(
+                f"archive format version {stored_version} is not supported; "
+                "no migration is defined for it"
+            )
         self.store.mkdir(parents=True, exist_ok=True)
         # Manifest before metadata: a crash in between leaves no metadata, so
         # the next constructor simply finishes the initialization. A format-2
@@ -263,12 +288,9 @@ class ForecastArchive:
         return self._backend.read_officials(self._current_actuals_manifest().officials)
 
     def _load_actuals_manifest(self) -> ActualsManifest:
-        """Load the actuals visibility manifest (mandatory at format 2)."""
-        if not self._actuals_manifest_path.exists():
-            raise StoreFormatError(
-                f"actuals visibility manifest is missing from {self.store}; the "
-                "archive is corrupt or was modified externally"
-            )
+        """Load the actuals visibility manifest (mandatory at format 2; a
+        missing file raises in the loader itself, so live-handle reloads get
+        the same typed corruption error as open does)."""
         return ActualsManifest.load(self._actuals_manifest_path)
 
     def _migrate_v1_actuals_visibility(self) -> None:
@@ -453,6 +475,7 @@ class ForecastArchive:
                 self._manifest,
                 self._backend.write_forecast_segment,
                 now=pd.Timestamp.now(),
+                record_integrity=self._record_segment_integrity,
             )
             # swap only after the durable save succeeded; a failed commit
             # leaves this handle's view at its pre-call state
@@ -560,10 +583,25 @@ class ForecastArchive:
                 self._refresh_summary_after_write()
                 return
 
+            # The conflict audit channel is required: detect the new
+            # ambiguities this batch would create and prove the destination
+            # writable BEFORE any durable side effect — but write the entries
+            # only AFTER the visibility commit, so the audit log never
+            # describes an ambiguity that was never committed.
+            if new_rows.empty:
+                combined = existing
+            elif existing.empty:
+                combined = new_rows
+            else:
+                combined = pd.concat([existing, new_rows], ignore_index=True)
+            pending_conflicts = self._pending_conflicts(combined)
+            if pending_conflicts:
+                self._preflight_error_log()
+
             # Segments are written invisibly; the manifest save below is the
             # single visibility point, so the actual rows and their official
             # designations appear together or not at all. A failure anywhere
-            # leaves only invisible files — any retry is clean.
+            # before it leaves only invisible files — any retry is clean.
             actuals_segment = (
                 self._backend.append_actuals_segment(new_rows) if not new_rows.empty else None
             )
@@ -572,16 +610,9 @@ class ForecastArchive:
                 if designations is not None
                 else None
             )
-            # The conflict audit log is required: written after validation
-            # (a rejected batch never reaches it) but before the visibility
-            # commit (an unwritable destination fails the call cleanly).
-            if new_rows.empty:
-                combined = existing
-            elif existing.empty:
-                combined = new_rows
-            else:
-                combined = pd.concat([existing, new_rows], ignore_index=True)
-            self._log_new_conflicts(combined)
+            self._record_segment_integrity(
+                [token for token in (actuals_segment, officials_segment) if token]
+            )
 
             committed = manifest.extended(actuals_segment, officials_segment)
             committed.save()
@@ -590,6 +621,15 @@ class ForecastArchive:
             logger.info(
                 "registered %d actual(s)%s", len(new_rows), " as official" if official else ""
             )
+            if pending_conflicts:
+                try:
+                    self._write_conflict_records(pending_conflicts)
+                except Exception as exc:
+                    raise ConflictLogError(
+                        "the registration committed durably, but writing its conflict "
+                        "audit records failed; the entries will be written by the next "
+                        "successful registration"
+                    ) from exc
         self._refresh_summary_after_write()
 
     def mark_official(
@@ -622,6 +662,7 @@ class ForecastArchive:
                 }
             )
             segment = self._backend.append_officials_segment(designation)
+            self._record_segment_integrity([segment])
             committed = manifest.extended(None, segment)
             committed.save()
             self._actuals_manifest = committed
@@ -690,26 +731,78 @@ class ForecastArchive:
         digest.update(f"priority:{json.dumps(self._source_priority or [])}\n".encode())
         return digest.hexdigest()
 
-    def _verify_committed_segments(self) -> None:
-        """Assert every committed segment's data is still present.
-
-        Raw data is the source of truth; if a committed file was deleted or
-        moved externally, every read path must fail with a typed error — the
-        disposable summary must never become authoritative over missing raw.
-        """
+    def _committed_tokens(self) -> list[str]:
         manifest = self._current_manifest()
         actuals_manifest = self._current_actuals_manifest()
-        committed = sorted(
+        return sorted(
             {run.segment for run in manifest.runs if not run.superseded and run.segment}
             | set(actuals_manifest.actuals)
             | set(actuals_manifest.officials)
         )
-        missing = self._backend.missing_segments(committed)
+
+    def _ensure_integrity_records(self) -> None:
+        """Adopt fingerprints for committed segments that lack one and prune
+        records for segments no longer committed.
+
+        Runs once at open (under the store lock): the upgrade path for stores
+        written before integrity tracking, and the explicit recovery path —
+        deleting the registry re-fingerprints current content as
+        authoritative.
+        """
+        registry = SegmentIntegrity.load(self._integrity_path)
+        tokens = self._committed_tokens()
+        changed = False
+        for token in tokens:
+            if token not in registry.entries:
+                registry.entries[token] = self._backend.fingerprint_segment(token)
+                changed = True
+        for stale in set(registry.entries) - set(tokens):
+            del registry.entries[stale]
+            changed = True
+        if changed:
+            registry.save()
+
+    def _record_segment_integrity(self, tokens: Sequence[str]) -> None:
+        """Fingerprint freshly written segments — called inside the store
+        lock, after the segment write and before the visibility commit, so a
+        committed segment always has its fingerprint on record."""
+        if not tokens:
+            return
+        registry = SegmentIntegrity.load(self._integrity_path)
+        for token in tokens:
+            registry.entries[token] = self._backend.fingerprint_segment(token)
+        registry.save()
+
+    def _verify_committed_segments(self) -> None:
+        """Assert every committed segment's data is present and unmodified.
+
+        Raw data is the source of truth; a committed file that was deleted,
+        replaced, or rewritten externally must fail every read path with a
+        typed error — the disposable summary must never become authoritative
+        over changed raw. This per-query probe compares size and mtime;
+        ``reconcile()`` verifies the full content hash.
+        """
+        committed = self._committed_tokens()
+        stats = self._backend.stat_segments(committed)
+        missing = [token for token in committed if token not in stats]
         if missing:
             raise StoreFormatError(
                 f"{len(missing)} committed segment(s) are missing from the store "
                 f"(e.g. {missing[0]!r}); raw archive data was deleted or modified "
                 "externally"
+            )
+        registry = SegmentIntegrity.load(self._integrity_path)
+        modified = [
+            token
+            for token in committed
+            if (record := registry.entries.get(token)) is None
+            or stats[token] != (record["size"], record["mtime_ns"])
+        ]
+        if modified:
+            raise StoreFormatError(
+                f"{len(modified)} committed segment(s) do not match their recorded "
+                f"integrity fingerprint (e.g. {modified[0]!r}); raw archive data was "
+                "modified externally"
             )
 
     def _valid_summary(self) -> pd.DataFrame | None:
@@ -753,8 +846,20 @@ class ForecastArchive:
         Divergence is a defect (ADR-003); raises :class:`ReconciliationError`.
         A summary that is merely absent or stale (e.g. after a crashed
         refresh) is rebuilt instead — staleness is recoverable by design;
-        disagreement at the same raw state is not.
+        disagreement at the same raw state is not. As the deep-audit
+        entrypoint, this also verifies the full content hash of every
+        committed segment (queries only probe size/mtime).
         """
+        self._verify_committed_segments()
+        registry = SegmentIntegrity.load(self._integrity_path)
+        for token in self._committed_tokens():
+            record = registry.entries.get(token)
+            fingerprint = self._backend.fingerprint_segment(token)
+            if record is None or fingerprint["sha256"] != record["sha256"]:
+                raise StoreFormatError(
+                    f"committed segment {token!r} does not match its recorded "
+                    "content hash; raw archive data was modified externally"
+                )
         recomputed = self._recompute_summary()
         stored = self._valid_summary()
         if stored is None:
@@ -779,29 +884,36 @@ class ForecastArchive:
                 f"recomputation ({len(recomputed_sorted)} cells)"
             )
 
-    def _log_new_conflicts(self, actuals: pd.DataFrame) -> None:
-        """Write newly observed unresolved same-timestamp conflicts to the
-        dedicated error-log file (a data-integrity channel, not app logging).
-
-        Called with the *would-be* log before the rows are appended, so a
-        failure here aborts the registration instead of committing data whose
-        integrity signal was lost. The flip side: if the registration crashes
-        after this point, an entry may describe a conflict that only
-        materializes on retry — a false positive in the loud channel, which
-        beats a silent miss.
-        """
+    def _pending_conflicts(self, actuals: pd.DataFrame) -> list[Conflict]:
+        """Unresolved same-timestamp conflicts not yet in the audit log."""
         resolved = resolve_effective_latest(actuals, self._source_priority)
         if not resolved.conflicts:
+            return []
+        logged: set[str] = set()
+        if self._conflicts_logged_path.exists():
+            logged = set(json.loads(self._conflicts_logged_path.read_text(encoding="utf-8")))
+        return [c for c in resolved.conflicts if c.key() not in logged]
+
+    def _preflight_error_log(self) -> None:
+        """Prove the required audit destination is writable before any
+        durable side effect — an unavailable conflict log must fail the
+        registration cleanly, not strand committed data without its signal."""
+        self._error_log.parent.mkdir(parents=True, exist_ok=True)
+        with self._error_log.open("a", encoding="utf-8"):
+            pass
+
+    def _write_conflict_records(self, conflicts: list[Conflict]) -> None:
+        """Write audit entries and advance the deduplication marker — only
+        called after the visibility commit, so the durable audit channel
+        never describes an ambiguity that was never committed."""
+        if not conflicts:
             return
         logged: set[str] = set()
         if self._conflicts_logged_path.exists():
             logged = set(json.loads(self._conflicts_logged_path.read_text(encoding="utf-8")))
-        new = [c for c in resolved.conflicts if c.key() not in logged]
-        if not new:
-            return
         self._error_log.parent.mkdir(parents=True, exist_ok=True)
         with self._error_log.open("a", encoding="utf-8") as handle:
-            for conflict in new:
+            for conflict in conflicts:
                 handle.write(
                     f"{pd.Timestamp.now().isoformat()} ambiguous-latest "
                     f"series={conflict.series_id} target={conflict.target.isoformat()} "
@@ -814,7 +926,7 @@ class ForecastArchive:
         os.replace(tmp, self._conflicts_logged_path)
         logger.warning(
             "%d unresolved same-timestamp actual conflict(s) written to the error log",
-            len(new),
+            len(conflicts),
         )
 
     # -- read surface ----------------------------------------------------------

@@ -109,10 +109,20 @@ class ActualsManifest:
 
     @classmethod
     def load(cls, path: Path) -> ActualsManifest:
+        """Load the manifest; a missing file is corruption, never emptiness.
+
+        The manifest is mandatory at format 2 — treating its absence as "no
+        actuals" would make a deleted manifest silently erase committed data
+        from a live handle's view. New empty manifests are constructed
+        directly, never via this loader.
+        """
         from .errors import StoreFormatError
 
         if not path.exists():
-            return cls(path=path)
+            raise StoreFormatError(
+                f"actuals visibility manifest is missing from {path.parent}; the "
+                "archive is corrupt or was modified externally"
+            )
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:

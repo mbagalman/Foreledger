@@ -48,6 +48,16 @@ class OfficialConflictError(ForecastArchiveError):
     """
 
 
+class ConflictLogError(ForecastArchiveError):
+    """A registration committed durably, but writing its required conflict
+    audit records failed afterwards.
+
+    The data is safe and visible; the audit entries are written by the next
+    successful registration (the deduplication marker only advances with the
+    entries). Raised so the missing integrity signal is never silent.
+    """
+
+
 class UnknownMetricError(ForecastArchiveError):
     """The requested metric name is not built in or registered."""
 

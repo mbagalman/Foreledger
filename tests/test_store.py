@@ -292,6 +292,90 @@ def test_tampered_manifest_cannot_read_outside_the_store(store: Path, tmp_path: 
         ForecastArchive(store)
 
 
+def test_deleting_manifest_on_a_live_handle_is_a_typed_error(store: Path) -> None:
+    """Review reproduction: a live handle must treat a deleted mandatory
+    manifest exactly like reopen does — typed corruption, never an
+    empty-archive view that silently hides committed actuals."""
+    archive = ForecastArchive(store)
+    archive.ingest(forecast_frame(1.0), model_id="alpha", model_version="v1")
+    archive.register_actuals(actuals_frame(), recorded_at="2026-02-01")
+    assert archive.accuracy_at_horizon(1, model_id="alpha", model_version="v1").status == "ok"
+
+    (store / "actuals_manifest.json").unlink()
+    with pytest.raises(StoreFormatError, match="manifest"):
+        archive.accuracy_at_horizon(1, model_id="alpha", model_version="v1")
+
+
+def test_inplace_modified_segment_is_a_typed_error(store: Path) -> None:
+    """Review reproduction: replacing a committed segment's content under the
+    same filename must fail loudly — the stale summary must never keep
+    serving over modified raw data."""
+    archive = ForecastArchive(store)
+    archive.ingest(forecast_frame(1.0), model_id="alpha", model_version="v1")
+    archive.register_actuals(actuals_frame(), recorded_at="2026-02-01")
+    assert archive.accuracy_at_horizon(1, model_id="alpha", model_version="v1").status == "ok"
+
+    manifest = json.loads((store / "actuals_manifest.json").read_text(encoding="utf-8"))
+    token = manifest["actuals"][0]
+    tampered = pd.read_parquet(store / token)
+    tampered["actual_value"] = tampered["actual_value"] + 100.0
+    tampered.to_parquet(store / token, index=False)
+
+    with pytest.raises(StoreFormatError, match="fingerprint"):
+        archive.accuracy_at_horizon(1, model_id="alpha", model_version="v1")
+    # a fresh handle fails the same way (the recorded fingerprint survives)
+    with pytest.raises(StoreFormatError, match="fingerprint"):
+        ForecastArchive(store).accuracy_at_horizon(1, model_id="alpha", model_version="v1")
+
+
+def test_inplace_modified_forecast_segment_is_a_typed_error(store: Path) -> None:
+    archive = ForecastArchive(store)
+    archive.ingest(forecast_frame(1.0), model_id="alpha", model_version="v1")
+    archive.register_actuals(actuals_frame(), recorded_at="2026-02-01")
+
+    runs = json.loads((store / "runs.json").read_text(encoding="utf-8"))
+    token = runs["runs"][0]["segment"]
+    tampered = pd.read_parquet(store / token)
+    tampered["value"] = tampered["value"] + 1.0
+    tampered.to_parquet(store / token, index=False)
+
+    with pytest.raises(StoreFormatError, match="fingerprint"):
+        archive.accuracy_at_horizon(1, model_id="alpha", model_version="v1")
+
+
+def test_reconcile_verifies_full_content_hash(store: Path) -> None:
+    """Queries probe size/mtime; reconcile() audits the sha256 — a registry
+    whose recorded hash disagrees with the bytes on disk must fail."""
+    archive = ForecastArchive(store)
+    archive.ingest(forecast_frame(1.0), model_id="alpha", model_version="v1")
+    archive.register_actuals(actuals_frame(), recorded_at="2026-02-01")
+    archive.reconcile()
+
+    registry_path = store / "segment_integrity.json"
+    registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    token = next(iter(registry["segments"]))
+    registry["segments"][token]["sha256"] = "0" * 64
+    registry_path.write_text(json.dumps(registry), encoding="utf-8")
+
+    with pytest.raises(StoreFormatError, match="hash"):
+        archive.reconcile()
+
+
+@pytest.mark.parametrize("bad_version", [0, -1, True, 1.5, "1"])
+def test_unknown_format_versions_are_refused(store: Path, bad_version: object) -> None:
+    """Only the current version opens and only version 1 migrates; unknown,
+    boolean, or non-integral values are corruption, never reinterpreted."""
+    ForecastArchive(store)
+    meta_path = store / "archive_meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["format_version"] = bad_version
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+    with pytest.raises(StoreFormatError):
+        ForecastArchive(store)
+    # the metadata was not rewritten
+    assert json.loads(meta_path.read_text(encoding="utf-8"))["format_version"] == bad_version
+
+
 def test_malformed_legacy_record_is_a_typed_error(store: Path) -> None:
     ForecastArchive(store)
     (store / "runs.json").write_text('{"runs": [{"series_key": "x"}]}', encoding="utf-8")

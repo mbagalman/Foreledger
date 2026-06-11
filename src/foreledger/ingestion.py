@@ -303,6 +303,7 @@ def commit_runs(
     manifest: RunManifest,
     write_segment: Any,
     now: pd.Timestamp,
+    record_integrity: Any = None,
 ) -> tuple[IngestResult, RunManifest]:
     """Write one invisible segment for the whole call, then commit visibility
     in one atomic manifest save.
@@ -340,6 +341,10 @@ def commit_runs(
     segment = write_segment(pd.concat(tagged_frames, ignore_index=True))
     for record in new_records:
         record.segment = segment
+    if record_integrity is not None:
+        # fingerprint before visibility: a committed segment always has its
+        # integrity record
+        record_integrity([segment])
 
     superseded_ids = {plan.supersedes.run_id for plan in planned if plan.supersedes is not None}
     candidate_runs = [
