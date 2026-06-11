@@ -59,3 +59,8 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 [tool.mypy]
 strict = true
 files = ["src"]
+
+[[tool.mypy.overrides]]
+# matplotlib is an optional, runtime-guarded import (AccuracyCurve.plot)
+module = ["matplotlib", "matplotlib.*"]
+ignore_missing_imports = true
