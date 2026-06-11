@@ -42,7 +42,7 @@ def test_persisted_champion_yields_deltas(populated: ForecastArchive) -> None:
     assert challenger["delta_vs_champion"] < 0
 
     # beta has no champion: no delta reported
-    assert beta["champion_version"] is None
+    assert pd.isna(beta["champion_version"])
     assert pd.isna(beta["delta_vs_champion"])
 
 
