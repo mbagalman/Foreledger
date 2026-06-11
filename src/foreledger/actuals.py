@@ -14,13 +14,21 @@ sticky: a later non-official registration never changes or unsets it.
 Designations live in their own append-only log so the actuals rows themselves
 are never rewritten; the explicit ``mark_official`` path is the only way to
 change a designation.
+
+Visibility is transactional: segment files are written invisibly and become
+readable only when the :class:`ActualsManifest` commits, so an actual and its
+official designation appear together or not at all — a failed call can never
+leave a half-finished pair that later changes results.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, cast
 
 import pandas as pd
@@ -39,6 +47,62 @@ logger = logging.getLogger("foreledger.actuals")
 _ACTUAL_INPUT = ("series_id", "target", "value")
 
 
+def validate_source_label(source: Any) -> None:
+    """Reject a non-string or blank ``source``.
+
+    ``source`` is part of the durable actual identity: a non-string value
+    would be persisted with a different Parquet dtype and poison every later
+    identity merge against the log.
+    """
+    if source is None:
+        return
+    if not isinstance(source, str) or not source.strip():
+        raise ValidationError(f"source must be a non-empty string feed label, got {source!r}")
+
+
+@dataclass
+class ActualsManifest:
+    """The single source of actuals/officials visibility.
+
+    Segment files are written invisibly; a registration's actual rows and
+    official designations become readable together when (and only when) this
+    manifest commits atomically. Files on disk but not listed here are the
+    invisible leftovers of failed calls — harmless, and retried cleanly.
+    """
+
+    path: Path
+    actuals: list[str] = field(default_factory=list)
+    officials: list[str] = field(default_factory=list)
+
+    @classmethod
+    def load(cls, path: Path) -> ActualsManifest:
+        from .errors import StoreFormatError
+
+        if not path.exists():
+            return cls(path=path)
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            actuals = [str(name) for name in payload["actuals"]]
+            officials = [str(name) for name in payload["officials"]]
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise StoreFormatError(f"actuals manifest at {path} is unreadable or corrupt") from exc
+        return cls(path=path, actuals=actuals, officials=officials)
+
+    def save(self) -> None:
+        payload = {"actuals": self.actuals, "officials": self.officials}
+        tmp = self.path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, indent=1), encoding="utf-8")
+        os.replace(tmp, self.path)
+
+    def extended(self, actuals: str | None, officials: str | None) -> ActualsManifest:
+        """A new manifest with the given segment names appended (not saved)."""
+        return ActualsManifest(
+            path=self.path,
+            actuals=[*self.actuals, *([actuals] if actuals else [])],
+            officials=[*self.officials, *([officials] if officials else [])],
+        )
+
+
 def canonicalize_actuals(
     frame: pd.DataFrame,
     mapping: Mapping[str, str] | None,
@@ -49,6 +113,7 @@ def canonicalize_actuals(
     """Map a user frame onto the canonical actuals columns."""
     if frame.empty:
         raise ValidationError("cannot register an empty actuals frame")
+    validate_source_label(source)
     resolved = _resolve_mapping(frame, mapping, _ACTUAL_INPUT)
     missing = [f for f in _ACTUAL_INPUT if f not in resolved]
     if missing:
@@ -243,31 +308,20 @@ def current_designations(officials: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def check_official_registration(
-    batch: pd.DataFrame, officials: pd.DataFrame, actuals: pd.DataFrame
-) -> pd.DataFrame:
+def check_official_registration(batch: pd.DataFrame, officials: pd.DataFrame) -> pd.DataFrame:
     """Validate an ``official=True`` registration against existing designations.
 
     Returns the designation rows to append. Raises before any append if a
-    target already has a different *live* official row — stickiness means
-    only the explicit ``mark_official`` path may change a designation.
-
-    A designation that dereferences no registered actual is an **orphan**:
-    the durable leftover of a registration whose actual append failed. It is
-    observably inert (the official basis never resolved it), so a new
-    official registration for that target supersedes it instead of
-    conflicting — this is what makes a failed default-timestamp registration
-    retryable through the same public call.
+    target already has a *different* official row — stickiness means only the
+    explicit ``mark_official`` path may change a designation. (Visibility is
+    manifest-committed, so every visible designation dereferences its actual;
+    inert orphans cannot exist.)
     """
     existing = current_designations(officials)
     to_append = batch[["series_id", "target", "source", "actual_recorded_at"]].copy()
     if not existing.empty:
-        live_marker = existing.merge(
-            actuals[_IDENTITY].drop_duplicates(), on=_IDENTITY, how="left", indicator=True
-        )
-        live_marker["is_live"] = live_marker["_merge"] == "both"
         merged = to_append.merge(
-            live_marker.drop(columns="_merge"),
+            existing,
             on=["series_id", "target"],
             how="left",
             suffixes=("", "_existing"),
@@ -278,17 +332,16 @@ def check_official_registration(
             & (merged["source_existing"] == merged["source"])
             & (merged["actual_recorded_at_existing"] == merged["actual_recorded_at"])
         )
-        is_live = merged["is_live"].fillna(False).astype(bool)
-        conflicting = has_existing & ~same_row & is_live
+        conflicting = has_existing & ~same_row
         if conflicting.any():
             raise OfficialConflictError(
                 f"{int(conflicting.sum())} target(s) already have a different "
                 "official actual; the designation is sticky — use mark_official "
                 "to change it explicitly"
             )
-        # append for new targets, and to supersede inert orphan designations
-        keep = ~has_existing | (~same_row & ~is_live)
-        to_append = merged.loc[keep, ["series_id", "target", "source", "actual_recorded_at"]]
+        to_append = merged.loc[
+            ~has_existing, ["series_id", "target", "source", "actual_recorded_at"]
+        ]
     return to_append.reset_index(drop=True)
 
 

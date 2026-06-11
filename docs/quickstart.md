@@ -314,6 +314,7 @@ forecast_ledger/
 ├── officials/*.parquet   # official designations (append-only)
 ├── summary/              # the disposable accuracy cache (+ validity token)
 ├── runs.json             # run manifest (identity, visibility, idempotency)
+├── actuals_manifest.json # actuals/officials visibility (transactional commit)
 ├── champions.json        # champion per model_id
 └── error_log.txt         # unresolved actuals conflicts (created on demand)
 ```

@@ -73,6 +73,8 @@ class Evaluator:
         source_priority: list[str] | None,
         champions: Callable[[], dict[str, str]],
         summary_provider: Callable[[], pd.DataFrame | None],
+        actuals_provider: Callable[[], pd.DataFrame],
+        officials_provider: Callable[[], pd.DataFrame],
     ) -> None:
         self._backend = backend
         self._active_run_ids = active_run_ids
@@ -83,6 +85,10 @@ class Evaluator:
         # state (validity token); a stale or absent summary yields None and
         # every query falls back to raw computation invisibly.
         self._summary_provider = summary_provider
+        # Manifest-gated views of the actuals/officials logs: only rows whose
+        # visibility was committed are ever read.
+        self._actuals_provider = actuals_provider
+        self._officials_provider = officials_provider
 
     # -- shared plumbing ---------------------------------------------------
 
@@ -119,13 +125,13 @@ class Evaluator:
         if fallback is not None and basis != "official":
             raise ValidationError("fallback='latest' only applies to basis='official'")
 
-        actuals = self._backend.read_actuals()
+        actuals = self._actuals_provider()
         latest = resolve_effective_latest(actuals, self._source_priority).latest.copy()
         latest["is_fallback"] = False
         if basis == "latest":
             return latest
 
-        official = resolve_effective_official(actuals, self._backend.read_officials()).copy()
+        official = resolve_effective_official(actuals, self._officials_provider()).copy()
         official["is_fallback"] = False
         if fallback == "latest" and not latest.empty:
             merged = latest.merge(

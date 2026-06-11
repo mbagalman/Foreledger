@@ -24,12 +24,14 @@ from typing import Any
 import pandas as pd
 
 from .actuals import (
+    ActualsManifest,
     canonicalize_actuals,
     check_official_registration,
     dedup_against_log,
     find_actual_row,
     resolve_effective_latest,
     resolve_effective_official,
+    validate_source_label,
 )
 from .backend import Backend, ForecastFilter, create_backend
 from .errors import ReconciliationError, StoreFormatError, ValidationError
@@ -93,6 +95,8 @@ class ForecastArchive:
         metric_timeout: float = DEFAULT_METRIC_TIMEOUT,
     ) -> None:
         self.store = Path(store)
+        for label in source_priority or []:
+            validate_source_label(label)
         # cheap refusal before creating anything (incl. the lock file) inside
         # a directory that is not ours
         self._refuse_non_archive_dir()
@@ -105,6 +109,10 @@ class ForecastArchive:
         self._manifest_path = self.store / "runs.json"
         self._manifest = self._load_manifest()
         self._manifest_key = self._manifest_file_key()
+        self._actuals_manifest_path = self.store / "actuals_manifest.json"
+        with self._lock():
+            self._actuals_manifest = self._load_actuals_manifest()
+        self._actuals_key = self._actuals_manifest_file_key()
         self._champions_path = self.store / "champions.json"
         self._conflicts_logged_path = self.store / "conflicts_logged.json"
         self._error_log = (
@@ -120,6 +128,8 @@ class ForecastArchive:
             source_priority=self._source_priority,
             champions=self.champions,
             summary_provider=self._valid_summary,
+            actuals_provider=self._visible_actuals,
+            officials_provider=self._visible_officials,
         )
 
     def _lock(self) -> StoreLock:
@@ -130,14 +140,18 @@ class ForecastArchive:
 
     # -- store lifecycle ---------------------------------------------------
 
-    #: The only files a concurrent constructor may legitimately observe in a
-    #: store before the metadata lands. Anything else — including arbitrary
-    #: ``*.tmp`` files — is user content and triggers the non-archive refusal.
-    _INIT_PLUMBING = frozenset({".foreledger.lock", "archive_meta.json.tmp"})
-
     def _foreign_entries(self) -> bool:
-        """True when the store directory holds anything that is not ours."""
-        return any(entry.name not in self._INIT_PLUMBING for entry in self.store.iterdir())
+        """True when the store directory holds anything that is not ours.
+
+        The metadata temp file is trusted only alongside the lock file: a
+        genuine concurrent initializer always creates the lock first, so a
+        lone ``archive_meta.json.tmp`` is user content, not ours.
+        """
+        names = {entry.name for entry in self.store.iterdir()}
+        allowed = {".foreledger.lock"}
+        if ".foreledger.lock" in names:
+            allowed.add("archive_meta.json.tmp")
+        return bool(names - allowed)
 
     def _refuse_non_archive_dir(self) -> None:
         if not self.store.exists():
@@ -194,6 +208,67 @@ class ForecastArchive:
             self._manifest = RunManifest.load(self._manifest_path)
             self._manifest_key = key
         return self._manifest
+
+    def _actuals_manifest_file_key(self) -> tuple[int, int] | None:
+        """A cheap change marker (mtime_ns, size) for the actuals manifest."""
+        try:
+            stat = self._actuals_manifest_path.stat()
+        except FileNotFoundError:
+            return None
+        return (stat.st_mtime_ns, stat.st_size)
+
+    def _current_actuals_manifest(self) -> ActualsManifest:
+        """The actuals manifest, reloaded if another handle has committed."""
+        key = self._actuals_manifest_file_key()
+        if key != self._actuals_key:
+            self._actuals_manifest = ActualsManifest.load(self._actuals_manifest_path)
+            self._actuals_key = key
+        return self._actuals_manifest
+
+    def _visible_actuals(self) -> pd.DataFrame:
+        return self._backend.read_actuals(self._current_actuals_manifest().actuals)
+
+    def _visible_officials(self) -> pd.DataFrame:
+        return self._backend.read_officials(self._current_actuals_manifest().officials)
+
+    def _load_actuals_manifest(self) -> ActualsManifest:
+        """Load the actuals visibility manifest, adopting pre-manifest stores.
+
+        Stores written before visibility was manifest-committed have segment
+        files but no manifest: adopt every actuals segment (they were all
+        visible), and adopt an officials segment only if its designations
+        dereference registered actuals — a dangling officials file is the
+        leftover of a failed pre-manifest call and must stay inert.
+        """
+        if self._actuals_manifest_path.exists():
+            return ActualsManifest.load(self._actuals_manifest_path)
+        actuals_segments, officials_segments = self._backend.list_segments()
+        if not actuals_segments and not officials_segments:
+            return ActualsManifest(path=self._actuals_manifest_path)
+
+        actuals = self._backend.read_actuals(actuals_segments)
+        identity = ["series_id", "target", "source", "actual_recorded_at"]
+        known = actuals[identity].drop_duplicates()
+        adopted_officials = []
+        for segment in officials_segments:
+            rows = self._backend.read_officials([segment])
+            live = rows.merge(known, on=identity, how="left", indicator=True)
+            if not rows.empty and (live["_merge"] == "both").all():
+                adopted_officials.append(segment)
+        manifest = ActualsManifest(
+            path=self._actuals_manifest_path,
+            actuals=actuals_segments,
+            officials=adopted_officials,
+        )
+        manifest.save()
+        logger.info(
+            "adopted pre-manifest actuals store: %d actuals segment(s), %d of %d "
+            "officials segment(s)",
+            len(actuals_segments),
+            len(adopted_officials),
+            len(officials_segments),
+        )
+        return manifest
 
     def _load_manifest(self) -> RunManifest:
         """Load the run manifest, migrating legacy (per series-set) records.
@@ -418,15 +493,45 @@ class ForecastArchive:
         """
         batch = canonicalize_actuals(frame, mapping, source, recorded_at, official)
         with self._lock():
-            existing = self._backend.read_actuals()
-            # Enforce the (series, target, source, recorded_at) identity
-            # against the existing log: exact replays collapse, differing
-            # values raise — both before anything is appended.
+            manifest = self._current_actuals_manifest()
+            existing = self._backend.read_actuals(manifest.actuals)
+            # All deterministic validation happens first, before any durable
+            # side effect (including the conflict audit log): enforce the
+            # (series, target, source, recorded_at) identity — exact replays
+            # collapse, differing values raise — and official stickiness.
             new_rows = dedup_against_log(batch, existing)
-            # Conflict bookkeeping runs against the would-be log BEFORE any
-            # append: if the required error-log destination cannot be
-            # written, the whole registration fails cleanly and retryably
-            # instead of committing data whose integrity signal was lost.
+            designations: pd.DataFrame | None = None
+            if official:
+                # Designations reference the full canonical batch: a replayed
+                # row already in the log may still need its designation.
+                designations = check_official_registration(
+                    batch, self._backend.read_officials(manifest.officials)
+                )
+                if designations.empty:
+                    designations = None
+                else:
+                    designations = designations.copy()
+                    designations["designated_at"] = pd.Timestamp.now()
+            if new_rows.empty and designations is None:
+                logger.info("registration was a no-op (exact replay)")
+                self._refresh_summary_after_write()
+                return
+
+            # Segments are written invisibly; the manifest save below is the
+            # single visibility point, so the actual rows and their official
+            # designations appear together or not at all. A failure anywhere
+            # leaves only invisible files — any retry is clean.
+            actuals_segment = (
+                self._backend.append_actuals_segment(new_rows) if not new_rows.empty else None
+            )
+            officials_segment = (
+                self._backend.append_officials_segment(designations)
+                if designations is not None
+                else None
+            )
+            # The conflict audit log is required: written after validation
+            # (a rejected batch never reaches it) but before the visibility
+            # commit (an unwritable destination fails the call cleanly).
             if new_rows.empty:
                 combined = existing
             elif existing.empty:
@@ -434,22 +539,11 @@ class ForecastArchive:
             else:
                 combined = pd.concat([existing, new_rows], ignore_index=True)
             self._log_new_conflicts(combined)
-            if official:
-                # Designations reference the full canonical batch: a replayed
-                # row already in the log may still need its designation.
-                designations = check_official_registration(
-                    batch, self._backend.read_officials(), existing
-                )
-                if not designations.empty:
-                    designations = designations.copy()
-                    designations["designated_at"] = pd.Timestamp.now()
-                    # Designation BEFORE actual: a designation without its
-                    # actual is inert (the official join finds nothing and
-                    # latest is untouched), whereas an actual without its
-                    # designation would already move latest-basis accuracy.
-                    # A retry — any timestamp — completes or supersedes it.
-                    self._backend.append_officials_segment(designations)
-            self._backend.append_actuals_segment(new_rows)
+
+            committed = manifest.extended(actuals_segment, officials_segment)
+            committed.save()
+            self._actuals_manifest = committed
+            self._actuals_key = self._actuals_manifest_file_key()
             logger.info(
                 "registered %d actual(s)%s", len(new_rows), " as official" if official else ""
             )
@@ -470,8 +564,10 @@ class ForecastArchive:
         already be registered; identify it by ``series``/``target`` plus, when
         several revisions exist, ``source`` and/or ``recorded_at``.
         """
+        validate_source_label(source)
         with self._lock():
-            actuals = self._backend.read_actuals()
+            manifest = self._current_actuals_manifest()
+            actuals = self._backend.read_actuals(manifest.actuals)
             row = find_actual_row(actuals, series, target, source, recorded_at)
             designation = pd.DataFrame(
                 {
@@ -482,7 +578,11 @@ class ForecastArchive:
                     "designated_at": [pd.Timestamp.now()],
                 }
             )
-            self._backend.append_officials_segment(designation)
+            segment = self._backend.append_officials_segment(designation)
+            committed = manifest.extended(None, segment)
+            committed.save()
+            self._actuals_manifest = committed
+            self._actuals_key = self._actuals_manifest_file_key()
         logger.info("official designation recorded")
         self._refresh_summary_after_write()
 
@@ -518,9 +618,7 @@ class ForecastArchive:
         forecasts = self._backend.read_forecasts(
             ForecastFilter(active_run_ids=self._current_manifest().active_run_ids())
         )
-        actuals = self._backend.read_actuals()
-        officials = self._backend.read_officials()
-        return forecasts, actuals, officials
+        return forecasts, self._visible_actuals(), self._visible_officials()
 
     def _recompute_summary(self) -> pd.DataFrame:
         forecasts, actuals, officials = self._raw_state()
@@ -537,8 +635,11 @@ class ForecastArchive:
         digest = hashlib.sha256()
         for run_id in sorted(self._current_manifest().active_run_ids()):
             digest.update(f"run:{run_id}\n".encode())
-        for component in sorted(self._backend.raw_state_components()):
-            digest.update(f"{component}\n".encode())
+        actuals_manifest = self._current_actuals_manifest()
+        for name in sorted(actuals_manifest.actuals):
+            digest.update(f"actuals:{name}\n".encode())
+        for name in sorted(actuals_manifest.officials):
+            digest.update(f"officials:{name}\n".encode())
         for component in sorted(self._registry.token_components()):
             digest.update(f"{component}\n".encode())
         # JSON, not a join: source labels are opaque user strings and may

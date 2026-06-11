@@ -47,6 +47,18 @@ def test_directory_with_arbitrary_tmp_file_is_refused(tmp_path: Path) -> None:
     assert not (target / "archive_meta.json").exists()
 
 
+def test_lone_reserved_tmp_name_without_lock_is_refused(tmp_path: Path) -> None:
+    """The reserved metadata temp name is trusted only alongside the lock
+    file: by itself it is user content, not evidence of an in-progress init."""
+    target = tmp_path / "userdir"
+    target.mkdir()
+    (target / "archive_meta.json.tmp").write_text("user data", encoding="utf-8")
+    with pytest.raises(StoreFormatError):
+        ForecastArchive(target)
+    assert (target / "archive_meta.json.tmp").read_text(encoding="utf-8") == "user data"
+    assert not (target / "archive_meta.json").exists()
+
+
 def test_corrupt_metadata_is_a_typed_error(store: Path) -> None:
     ForecastArchive(store)
     (store / "archive_meta.json").write_text("{not json", encoding="utf-8")
@@ -138,6 +150,40 @@ def test_unrecognized_manifest_shape_is_a_typed_error(store: Path) -> None:
     (store / "runs.json").write_text('{"runs": [{"unknown_field": 1}]}', encoding="utf-8")
     with pytest.raises(StoreFormatError):
         ForecastArchive(store)
+
+
+def test_pre_manifest_actuals_store_is_adopted(store: Path) -> None:
+    """Stores written before actuals visibility was manifest-committed adopt
+    their visible segments losslessly; dangling officials (the leftovers of
+    failed pre-manifest calls) stay inert."""
+    archive = ForecastArchive(store)
+    archive.ingest(forecast_frame(1.0), model_id="alpha", model_version="v1")
+    archive.register_actuals(actuals_frame(), source="feed", recorded_at="2026-02-01")
+    target = actuals_frame()["target"].iloc[0]
+    archive.mark_official(series="S1", target=target, source="feed")
+    expected = archive.accuracy_at_horizon(1, model_id="alpha", model_version="v1")
+    officials_before = len(archive._visible_officials())
+
+    # simulate a pre-manifest store: drop the manifest, add a dangling
+    # officials segment referencing an actual that was never registered
+    (store / "actuals_manifest.json").unlink()
+    dangling = pd.DataFrame(
+        {
+            "series_id": ["S1"],
+            "target": [pd.Timestamp("2030-01-01")],
+            "source": ["ghost"],
+            "actual_recorded_at": [pd.Timestamp("2030-01-01")],
+            "designated_at": [pd.Timestamp("2030-01-01")],
+        }
+    )
+    dangling.to_parquet(store / "officials" / "dangling.parquet", index=False)
+
+    reopened = ForecastArchive(store)
+    result = reopened.accuracy_at_horizon(1, model_id="alpha", model_version="v1")
+    assert result.value == expected.value
+    assert result.n == expected.n
+    assert len(reopened._visible_officials()) == officials_before  # dangling excluded
+    reopened.reconcile()
 
 
 def test_malformed_legacy_record_is_a_typed_error(store: Path) -> None:

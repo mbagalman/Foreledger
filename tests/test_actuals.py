@@ -198,7 +198,7 @@ def test_identical_replay_collapses(archive: ForecastArchive) -> None:
     ts = "2026-02-01T12:00:00"
     archive.register_actuals(one_target_frame(100.0), source="a", recorded_at=ts)
     archive.register_actuals(one_target_frame(100.0), source="a", recorded_at=ts)  # replay
-    log = archive._backend.read_actuals()
+    log = archive._visible_actuals()
     assert len(log) == 1  # the replay appended nothing
     assert mae_at_h1(archive).status == "ok"
 
@@ -293,9 +293,9 @@ def test_priority_token_encoding_is_delimiter_safe(store: Path) -> None:
 def test_failed_default_timestamp_official_registration_is_retryable(
     archive: ForecastArchive, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A failed official registration leaves an orphan designation; a plain
-    retry through the same public call (default recorded_at) must supersede
-    the inert orphan, not raise OfficialConflictError."""
+    """A failed official registration leaves only invisible segment files
+    (the manifest never committed); a plain retry through the same public
+    call (default recorded_at) must succeed."""
     setup_forecasts(archive)
 
     def failing(frame: pd.DataFrame) -> None:
@@ -321,13 +321,101 @@ def test_failed_default_timestamp_official_registration_is_retryable(
 def test_orphan_recovery_does_not_weaken_live_stickiness(
     archive: ForecastArchive,
 ) -> None:
-    """Superseding inert orphans must not let a *live* official be replaced."""
+    """Failure recovery must not let a *live* official be replaced."""
     setup_forecasts(archive)
     archive.register_actuals(
         one_target_frame(100.0), source="rev1", official=True, recorded_at="2026-02-01"
     )
     with pytest.raises(OfficialConflictError):
         archive.register_actuals(one_target_frame(120.0), source="rev2", official=True)
+
+
+def test_nonofficial_registration_cannot_activate_a_failed_officials_intent(
+    archive: ForecastArchive, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review reproduction: a failed official=True call must leave no durable
+    official intent that a later official=False call could silently activate."""
+    setup_forecasts(archive)
+    ts = "2026-02-01T12:00:00"
+
+    def failing(frame: pd.DataFrame) -> str:
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr(archive._backend, "append_actuals_segment", failing)
+    with pytest.raises(OSError):
+        archive.register_actuals(
+            one_target_frame(100.0), source="rev1", official=True, recorded_at=ts
+        )
+    monkeypatch.undo()
+
+    # the same identity registered WITHOUT the official flag
+    archive.register_actuals(one_target_frame(100.0), source="rev1", recorded_at=ts)
+    assert mae_at_h1(archive).status == "ok"
+    # the failed call's official intent must not have survived
+    strict = mae_at_h1(archive, basis="official")
+    assert strict.status == "insufficient"
+    archive.reconcile()
+
+
+def test_failed_visibility_commit_leaves_nothing_and_retries_cleanly(
+    archive: ForecastArchive, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The manifest save is the single visibility point: if it fails, neither
+    the actual nor its designation is readable, and any retry works."""
+    setup_forecasts(archive)
+
+    def failing_save(self: object) -> None:
+        raise OSError("simulated crash at the visibility commit")
+
+    monkeypatch.setattr("foreledger.actuals.ActualsManifest.save", failing_save)
+    with pytest.raises(OSError):
+        archive.register_actuals(one_target_frame(100.0), source="rev1", official=True)
+    assert len(archive._visible_actuals()) == 0
+    assert mae_at_h1(archive).status == "insufficient"
+
+    monkeypatch.undo()
+    archive.register_actuals(one_target_frame(100.0), source="rev1", official=True)
+    assert mae_at_h1(archive).status == "ok"
+    assert mae_at_h1(archive, basis="official").status == "ok"
+    archive.reconcile()
+
+
+def test_non_string_source_rejected_and_store_stays_usable(
+    archive: ForecastArchive,
+) -> None:
+    """Review reproduction: a non-string source must be rejected before any
+    write — persisting it would poison the durable identity column and block
+    all later registrations."""
+    setup_forecasts(archive)
+    with pytest.raises(ValidationError, match="source"):
+        archive.register_actuals(one_target_frame(100.0), source=123)  # type: ignore[arg-type]
+    with pytest.raises(ValidationError, match="source"):
+        archive.register_actuals(one_target_frame(100.0), source="   ")
+
+    # the store remains fully usable for a valid registration
+    archive.register_actuals(one_target_frame(100.0), source="feed")
+    assert mae_at_h1(archive).status == "ok"
+
+
+def test_non_string_source_priority_rejected(store: Path) -> None:
+    with pytest.raises(ValidationError, match="source"):
+        ForecastArchive(store, source_priority=["feed", 123])  # type: ignore[list-item]
+
+
+def test_rejected_official_conflict_leaves_audit_files_untouched(
+    archive: ForecastArchive, store: Path
+) -> None:
+    """Validation precedes conflict-log mutation: a batch rejected for
+    official stickiness must not leave entries in the integrity channel."""
+    setup_forecasts(archive)
+    ts = "2026-02-01T12:00:00"
+    archive.register_actuals(one_target_frame(100.0), source="a", official=True, recorded_at=ts)
+    with pytest.raises(OfficialConflictError):
+        archive.register_actuals(one_target_frame(110.0), source="b", official=True, recorded_at=ts)
+    assert not (store / "error_log.txt").exists()
+    assert not (store / "conflicts_logged.json").exists()
+    # and the rejected row was never committed
+    assert len(archive._visible_actuals()) == 1
 
 
 def test_unwritable_error_log_fails_registration_before_commit(store: Path) -> None:
@@ -343,7 +431,7 @@ def test_unwritable_error_log_fails_registration_before_commit(store: Path) -> N
     with pytest.raises(OSError):
         archive.register_actuals(one_target_frame(110.0), source="b", recorded_at=ts)
     # the conflicting row was never committed; the call is retryable
-    assert len(archive._backend.read_actuals()) == 1
+    assert len(archive._visible_actuals()) == 1
     assert mae_at_h1(archive).status == "ok"
 
 
@@ -362,7 +450,7 @@ def test_failed_designation_append_leaves_nothing_visible(
             one_target_frame(100.0), source="rev1", official=True, recorded_at=ts
         )
     # the designation write comes first, so the failed call left no trace
-    assert len(archive._backend.read_actuals()) == 0
+    assert len(archive._visible_actuals()) == 0
     assert mae_at_h1(archive).status == "insufficient"
 
     monkeypatch.undo()

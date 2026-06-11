@@ -102,12 +102,15 @@ class Backend(ABC):
         relative file path)."""
 
     @abstractmethod
-    def append_actuals_segment(self, frame: pd.DataFrame) -> None:
-        """Append a batch of actuals rows atomically (append-only log)."""
+    def append_actuals_segment(self, frame: pd.DataFrame) -> str:
+        """Persist a non-empty actuals batch atomically; invisible until its
+        returned segment token is committed in the actuals manifest."""
 
     @abstractmethod
-    def append_officials_segment(self, frame: pd.DataFrame) -> None:
-        """Append official-designation rows atomically (append-only log)."""
+    def append_officials_segment(self, frame: pd.DataFrame) -> str:
+        """Persist non-empty official-designation rows atomically; invisible
+        until the returned segment token is committed in the actuals
+        manifest."""
 
     @abstractmethod
     def replace_summary(self, frame: pd.DataFrame, state_token: str) -> None:
@@ -123,20 +126,19 @@ class Backend(ABC):
         """Scan the raw archive under an engine-neutral filter."""
 
     @abstractmethod
-    def read_actuals(self) -> pd.DataFrame:
-        """Read the full actuals log (canonical actuals schema)."""
+    def read_actuals(self, segments: Sequence[str]) -> pd.DataFrame:
+        """Read the listed actuals segments (canonical actuals schema)."""
 
     @abstractmethod
-    def read_officials(self) -> pd.DataFrame:
-        """Read the official-designation log."""
+    def read_officials(self, segments: Sequence[str]) -> pd.DataFrame:
+        """Read the listed official-designation segments."""
+
+    @abstractmethod
+    def list_segments(self) -> tuple[list[str], list[str]]:
+        """All stored (actuals, officials) segment tokens — committed or not.
+        Used once at open to adopt pre-manifest stores."""
 
     @abstractmethod
     def read_summary(self) -> tuple[pd.DataFrame, str] | None:
         """Read the stored summary and its raw-state token, or None if absent
         (the summary is always rebuildable from raw)."""
-
-    @abstractmethod
-    def raw_state_components(self) -> list[str]:
-        """Opaque strings that change whenever stored actuals/officials
-        change (e.g. segment names). Combined with the manifest's active
-        run_ids they form the raw-state token that gates summary validity."""

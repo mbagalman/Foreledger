@@ -109,5 +109,5 @@ def test_actuals_appends_from_two_handles_both_land(store: Path) -> None:
     handle_b.register_actuals(actuals.tail(len(actuals) - half), recorded_at="2026-02-01")
 
     reopened = ForecastArchive(store)
-    assert len(reopened._backend.read_actuals()) == len(actuals)
+    assert len(reopened._visible_actuals()) == len(actuals)
     reopened.reconcile()

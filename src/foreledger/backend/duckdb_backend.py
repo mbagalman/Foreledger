@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import uuid
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -96,15 +97,15 @@ class DuckDBBackend(Backend):
         self._atomic_write(frame, path)
         return path.relative_to(self.store).as_posix()
 
-    def append_actuals_segment(self, frame: pd.DataFrame) -> None:
-        if frame.empty:
-            return
-        self._atomic_write(frame, self.actuals_dir / f"{uuid.uuid4().hex}.parquet")
+    def append_actuals_segment(self, frame: pd.DataFrame) -> str:
+        path = self.actuals_dir / f"{uuid.uuid4().hex}.parquet"
+        self._atomic_write(frame, path)
+        return path.relative_to(self.store).as_posix()
 
-    def append_officials_segment(self, frame: pd.DataFrame) -> None:
-        if frame.empty:
-            return
-        self._atomic_write(frame, self.officials_dir / f"{uuid.uuid4().hex}.parquet")
+    def append_officials_segment(self, frame: pd.DataFrame) -> str:
+        path = self.officials_dir / f"{uuid.uuid4().hex}.parquet"
+        self._atomic_write(frame, path)
+        return path.relative_to(self.store).as_posix()
 
     def replace_summary(self, frame: pd.DataFrame, state_token: str) -> None:
         # Data first, token second: a crash in between leaves a mismatched
@@ -130,8 +131,11 @@ class DuckDBBackend(Backend):
         frame["horizon"] = frame["horizon"].astype("int64")
         return frame
 
-    def read_actuals(self) -> pd.DataFrame:
-        files = self._files(self.actuals_dir)
+    def _segment_files(self, segments: Sequence[str]) -> list[str]:
+        return [(self.store / name).as_posix() for name in segments if (self.store / name).exists()]
+
+    def read_actuals(self, segments: Sequence[str]) -> pd.DataFrame:
+        files = self._segment_files(segments)
         if not files:
             return empty_actuals()
         sql = (
@@ -140,8 +144,8 @@ class DuckDBBackend(Backend):
         )
         return self._query(sql, [])
 
-    def read_officials(self) -> pd.DataFrame:
-        files = self._files(self.officials_dir)
+    def read_officials(self, segments: Sequence[str]) -> pd.DataFrame:
+        files = self._segment_files(segments)
         if not files:
             return _empty_officials()
         sql = (
@@ -149,6 +153,15 @@ class DuckDBBackend(Backend):
             f"FROM {self._source_expr(files)} ORDER BY designated_at"
         )
         return self._query(sql, [])
+
+    def list_segments(self) -> tuple[list[str], list[str]]:
+        def relative(paths: list[str]) -> list[str]:
+            return [Path(p).relative_to(self.store).as_posix() for p in paths]
+
+        return (
+            relative(self._files(self.actuals_dir)),
+            relative(self._files(self.officials_dir)),
+        )
 
     def read_summary(self) -> tuple[pd.DataFrame, str] | None:
         path = self.summary_dir / "summary.parquet"
@@ -169,9 +182,3 @@ class DuckDBBackend(Backend):
             )
             return None
         return frame, token
-
-    def raw_state_components(self) -> list[str]:
-        return [
-            *(f"actuals:{name}" for name in self._files(self.actuals_dir)),
-            *(f"officials:{name}" for name in self._files(self.officials_dir)),
-        ]
