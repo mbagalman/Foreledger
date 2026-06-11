@@ -26,3 +26,5 @@ jobs:
         run: mypy src
       - name: Test
         run: pytest -q
+      - name: Quickstart check
+        run: python examples/quickstart.py

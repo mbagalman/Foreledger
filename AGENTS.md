@@ -39,7 +39,7 @@ These are project decisions that deviate from defaults — the ADRs record why; 
 
 ## Permissions
 
-Verbatim from `implementation-plan-forecast-archive.md` (Agent execution boundaries).
+Verbatim from `docs/implementation-plan-forecast-archive.md` (Agent execution boundaries).
 
 **Allowed without approval:**
 - Edit source under `src/forecast_archive/`.
@@ -90,6 +90,6 @@ Do not report a task complete until:
 
 ## References
 
-- Architecture and data model: `tech-spec-forecast-archive-final.md`
-- Decisions and rationale: `adr-001`…`adr-007` (`*.md` in this directory)
-- Phased plan, risks, rollout: `implementation-plan-forecast-archive.md`
+- Architecture and data model: `docs/tech-spec-forecast-archive-final.md`
+- Decisions and rationale: `adr-001`…`adr-007` (`*.md` in `docs/`)
+- Phased plan, risks, rollout: `docs/implementation-plan-forecast-archive.md`

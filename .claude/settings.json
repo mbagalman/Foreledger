@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(ruff check . 2>&1)",
+      "PowerShell(ruff format --check . 2>&1)",
+      "PowerShell(mypy src 2>&1)",
+      "PowerShell(ruff check --fix . 2>&1)",
+      "PowerShell(ruff format . 2>&1)",
+      "PowerShell(python examples/quickstart.py | Out-Null; \"exit=$LASTEXITCODE\")"
+    ]
+  }
+}

@@ -12,8 +12,29 @@ All storage and query goes through a dialect-aware backend seam: DuckDB over
 Parquet in v1, with warehouse-native backends (Snowflake) as a v1.1
 fast-follow.
 
-> **Status:** pre-alpha scaffolding. The public API lands in Phases 1–4 of the
-> [implementation plan](docs/implementation-plan-forecast-archive.md).
+> **Status:** working MVP (Phases 1–4 of the
+> [implementation plan](docs/implementation-plan-forecast-archive.md)): ingestion
+> with atomic, idempotent runs; the revisable actuals log with official
+> designations; built-in + registerable metrics; the eager, rebuildable accuracy
+> summary; and the full evaluation/comparison/`as_of` query surface. Packaging
+> and release (Phase 5) and the Snowflake backend (Phase 6, v1.1) remain.
+
+## Quickstart
+
+```bash
+pip install -e .
+python examples/quickstart.py   # synthetic fixture -> accuracy-vs-horizon curves
+```
+
+```python
+from forecast_archive import ForecastArchive
+
+archive = ForecastArchive("./my_archive")
+archive.ingest(forecasts_df, model_id="prophet", model_version="2.1")
+archive.register_actuals(actuals_df, source="warehouse")
+curve = archive.accuracy_curve(metric="MAE", model_id="prophet", model_version="2.1")
+print(curve.to_frame())
+```
 
 ## Development
 
