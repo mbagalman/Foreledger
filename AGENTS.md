@@ -4,7 +4,7 @@ Foreledger (working name during design: "Production Forecast Archive") — a Pyt
 
 ## Tooling and versions
 
-- Python ≥ 3.11 (pin the exact minor in `pyproject.toml`; see "Verify" in the cover note).
+- Python ≥ 3.11 (declared as `requires-python = ">=3.11"` in `pyproject.toml`; CI tests the supported minors explicitly).
 - DuckDB — pinned, tested range in `pyproject.toml` (the only storage/query engine in v1; Snowflake is a v1.1 fast-follow).
 - Storage format: Apache Parquet (Arrow) on local disk (v1); warehouse-native tables at v1.1.
 - DataFrame interop: pandas and/or Polars (returned by the query API).
