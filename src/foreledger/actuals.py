@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -41,6 +40,7 @@ from .ingestion import (
     validate_finite_values,
     validate_series_ids,
 )
+from .jsonstore import atomic_write_json
 from .schema import DEFAULT_SOURCE, to_timestamp
 
 logger = logging.getLogger("foreledger.actuals")
@@ -134,10 +134,7 @@ class ActualsManifest:
         )
 
     def save(self) -> None:
-        payload = {"actuals": self.actuals, "officials": self.officials}
-        tmp = self.path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(payload, indent=1), encoding="utf-8")
-        os.replace(tmp, self.path)
+        atomic_write_json(self.path, {"actuals": self.actuals, "officials": self.officials})
 
     def extended(self, actuals: str | None, officials: str | None) -> ActualsManifest:
         """A new manifest with the given segment names appended (not saved)."""
@@ -267,28 +264,35 @@ def resolve_effective_latest(
 
     Ambiguous targets (unresolved same-timestamp conflicts) are excluded from
     the latest basis and reported, never silently picked.
+
+    Vectorized for the overwhelmingly common case: groups whose newest rows
+    agree on one value resolve in bulk; the per-group tiebreak loop runs only
+    over groups with a genuine same-timestamp value conflict.
     """
     if actuals.empty:
         return EffectiveActuals(latest=_empty_effective())
+
+    keys = ["series_id", "target"]
+    newest = actuals[
+        actuals["actual_recorded_at"]
+        == actuals.groupby(keys)["actual_recorded_at"].transform("max")
+    ]
+    distinct_values = newest.groupby(keys)["actual_value"].transform("nunique")
+    clean = (
+        newest[distinct_values == 1]
+        .drop_duplicates(subset=keys)[keys + ["actual_value"]]
+        .astype({"actual_value": "float64"})
+    )
+    conflicted = newest[distinct_values > 1]
+    if conflicted.empty:
+        return EffectiveActuals(latest=clean.sort_values(keys).reset_index(drop=True))
 
     rows: list[dict[str, Any]] = []
     ambiguous: list[tuple[str, pd.Timestamp]] = []
     conflicts: list[Conflict] = []
     priority = list(source_priority or [])
 
-    for (series_id, target), group in actuals.groupby(["series_id", "target"], sort=True):
-        max_recorded = group["actual_recorded_at"].max()
-        tied = group[group["actual_recorded_at"] == max_recorded]
-        values = tied["actual_value"].unique()
-        if len(values) == 1:
-            rows.append(
-                {
-                    "series_id": series_id,
-                    "target": target,
-                    "actual_value": float(values[0]),
-                }
-            )
-            continue
+    for (series_id, target), tied in conflicted.groupby(keys, sort=True):
         sources = list(tied["source"])
         distinct = len(set(sources)) == len(sources)
         if priority and distinct and all(src in priority for src in sources):
@@ -301,13 +305,16 @@ def resolve_effective_latest(
             Conflict(
                 series_id=str(series_id),
                 target=pd.Timestamp(cast("Any", target)),
-                recorded_at=pd.Timestamp(max_recorded),
+                recorded_at=pd.Timestamp(tied["actual_recorded_at"].iloc[0]),
                 sources=tuple(str(s) for s in tied["source"]),
                 values=tuple(float(v) for v in tied["actual_value"]),
             )
         )
 
-    latest = pd.DataFrame(rows) if rows else _empty_effective()
+    resolved = pd.DataFrame(rows) if rows else _empty_effective()
+    latest = (
+        pd.concat([clean, resolved], ignore_index=True).sort_values(keys).reset_index(drop=True)
+    )
     return EffectiveActuals(latest=latest, ambiguous=ambiguous, conflicts=conflicts)
 
 

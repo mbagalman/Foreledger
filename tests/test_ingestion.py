@@ -228,6 +228,28 @@ def test_non_finite_forecast_values_rejected(archive: ForecastArchive, bad_value
         archive.ingest(frame, model_id="alpha", model_version="v1")
 
 
+def test_content_hash_payload_is_pinned() -> None:
+    """The hash format is persisted in runs.json and drives idempotency
+    against existing archives — it must never drift across refactors."""
+    import hashlib
+
+    from foreledger.ingestion import content_hash
+
+    group = pd.DataFrame(
+        {
+            "series_id": ["B", "A"],
+            "target": pd.to_datetime(["2026-01-03", "2026-01-02"]),
+            "value": pd.Series([2.5, 1.0], dtype="float64"),
+        }
+    )
+    # independent reference: the original per-row formulation
+    ordered = group.sort_values(["series_id", "target"])
+    digest = hashlib.sha256()
+    for s, t, v in zip(ordered["series_id"], ordered["target"], ordered["value"], strict=True):
+        digest.update(f"{s}\x1f{t.isoformat()}\x1f{v!r}\n".encode())
+    assert content_hash(group) == digest.hexdigest()
+
+
 def test_nixtla_adapter_equals_explicit_ingest(tmp_path: object) -> None:
     from pathlib import Path
 

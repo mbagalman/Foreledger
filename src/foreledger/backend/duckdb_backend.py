@@ -22,6 +22,7 @@ import duckdb
 import pandas as pd
 
 from ..errors import StoreFormatError
+from ..jsonstore import atomic_write_json
 from ..schema import empty_actuals, empty_forecasts
 from .base import Backend, Dialect, ForecastFilter, build_forecast_predicate
 
@@ -113,10 +114,9 @@ class DuckDBBackend(Backend):
         # Data first, token second: a crash in between leaves a mismatched
         # token, so the half-replaced summary is never served.
         self._atomic_write(frame, self.summary_dir / "summary.parquet")
-        meta_path = self.summary_dir / "summary_meta.json"
-        tmp = meta_path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps({"state_token": state_token}), encoding="utf-8")
-        os.replace(tmp, meta_path)
+        atomic_write_json(
+            self.summary_dir / "summary_meta.json", {"state_token": state_token}, indent=None
+        )
 
     # -- reads ---------------------------------------------------------------
 

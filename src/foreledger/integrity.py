@@ -33,10 +33,12 @@ normalized on first open.)
 from __future__ import annotations
 
 import json
-import os
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from .jsonstore import atomic_write_json
 
 _REQUIRED_KEYS = {"size", "mtime_ns", "sha256"}
 
@@ -72,6 +74,77 @@ class SegmentIntegrity:
         return cls(path=path, entries=entries)
 
     def save(self) -> None:
-        tmp = self.path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps({"segments": self.entries}, indent=1), encoding="utf-8")
-        os.replace(tmp, self.path)
+        atomic_write_json(self.path, {"segments": self.entries})
+
+
+def record_segments(
+    path: Path,
+    fingerprint: Callable[[str], dict[str, Any]],
+    tokens: Sequence[str],
+    *,
+    committed: bool = False,
+    create_if_missing: bool = False,
+) -> None:
+    """Journal fingerprints for freshly written segments — called inside the
+    store lock, after the segment write and before the visibility commit
+    (staged), then flipped via :func:`mark_committed` once the commit
+    succeeds. ``create_if_missing`` is reserved for migrations; at format 3 a
+    missing registry is corruption, never something a write path may
+    recreate."""
+    if not tokens:
+        return
+    if create_if_missing and not path.exists():
+        registry = SegmentIntegrity(path=path)
+    else:
+        registry = SegmentIntegrity.load(path)
+    for token in tokens:
+        registry.entries[token] = {**fingerprint(token), "committed": committed}
+    registry.save()
+
+
+def mark_committed(path: Path, tokens: Sequence[str]) -> None:
+    """Flip staged journal entries to committed, right after the visibility
+    commit succeeded (still under the store lock)."""
+    if not tokens:
+        return
+    registry = SegmentIntegrity.load(path)
+    for token in tokens:
+        if token in registry.entries:
+            registry.entries[token]["committed"] = True
+    registry.save()
+
+
+def reconcile_journal(path: Path, referenced: set[str]) -> None:
+    """Open-time journal reconciliation (caller holds the store lock).
+
+    Three-way rule per registry entry:
+    - referenced by a manifest → it was committed; ensure the flag says so
+      (repairs the crash window between a manifest save and the flip);
+    - unreferenced and staged → the orphan of a failed write: prune;
+    - unreferenced and *committed* → the mutable manifests stopped
+      referencing committed history: corruption, never a prune.
+
+    Entries without the flag (older format-3 stores) are normalized:
+    referenced ones become committed, unreferenced ones prune as the old
+    semantics did.
+    """
+    from .errors import StoreFormatError
+
+    registry = SegmentIntegrity.load(path)
+    changed = False
+    for token, record in list(registry.entries.items()):
+        flag = record.get("committed")
+        if token in referenced:
+            if flag is not True:
+                record["committed"] = True
+                changed = True
+        elif flag is True:
+            raise StoreFormatError(
+                f"visibility metadata no longer references committed segment "
+                f"{token!r}; runs.json or actuals_manifest.json was modified externally"
+            )
+        else:
+            del registry.entries[token]
+            changed = True
+    if changed:
+        registry.save()

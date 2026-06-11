@@ -15,14 +15,13 @@ import dataclasses
 import hashlib
 import json
 import logging
-import os
-import uuid
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
+from . import lifecycle
 from .actuals import (
     ActualsManifest,
     Conflict,
@@ -44,15 +43,13 @@ from .errors import (
 from .ingestion import (
     IngestResult,
     RunManifest,
-    RunRecord,
     canonicalize_forecasts,
     commit_runs,
-    content_hash,
     load_manifest_entries,
     plan_runs,
-    validate_forecast_segment_token,
 )
-from .integrity import SegmentIntegrity
+from .integrity import SegmentIntegrity, mark_committed, reconcile_journal, record_segments
+from .jsonstore import atomic_write_json, file_key
 from .locking import StoreLock
 from .metrics import DEFAULT_METRIC_TIMEOUT, MetricFn, MetricRegistry
 from .query import Evaluator, Period
@@ -163,121 +160,21 @@ class ForecastArchive:
         the public write methods — helpers never re-acquire it."""
         return StoreLock(self.store / ".foreledger.lock")
 
-    # -- store lifecycle ---------------------------------------------------
-
-    def _foreign_entries(self) -> bool:
-        """True when the store directory holds anything that is not ours.
-
-        The metadata temp file is trusted only alongside the lock file: a
-        genuine concurrent initializer always creates the lock first, so a
-        lone ``archive_meta.json.tmp`` is user content, not ours.
-        """
-        names = {entry.name for entry in self.store.iterdir()}
-        allowed = {".foreledger.lock"}
-        if ".foreledger.lock" in names:
-            # files a crashed/concurrent initializer may have left mid-init
-            allowed.update(
-                {
-                    "archive_meta.json.tmp",
-                    "actuals_manifest.json",
-                    "actuals_manifest.json.tmp",
-                    "runs.json",
-                    "runs.json.tmp",
-                    "segment_integrity.json",
-                    "segment_integrity.json.tmp",
-                }
-            )
-        return bool(names - allowed)
+    # -- store lifecycle (delegates to foreledger.lifecycle) -----------------
 
     def _refuse_non_archive_dir(self) -> None:
-        if not self.store.exists():
-            return
-        if not self.store.is_dir():
-            raise StoreFormatError(f"store path {self.store} is not a directory")
-        if self._foreign_entries() and not (self.store / _META_FILE).exists():
-            raise StoreFormatError(
-                f"{self.store} is not empty and has no archive metadata; refusing "
-                "to initialize over existing contents"
-            )
-
-    def _stored_format_version(self) -> int | None:
-        meta_path = self.store / _META_FILE
-        if not meta_path.exists():
-            return None
-        try:
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            raw = meta["format_version"]
-        except (KeyError, json.JSONDecodeError) as exc:
-            raise StoreFormatError(
-                f"archive metadata at {meta_path} is unreadable or corrupt"
-            ) from exc
-        # strict: booleans are ints in Python, "1" is not a version
-        if isinstance(raw, bool) or not isinstance(raw, int):
-            raise StoreFormatError(
-                f"archive metadata at {meta_path} declares a non-integer format "
-                f"version {raw!r}; the store is corrupt"
-            )
-        return int(raw)
-
-    def _write_format_version(self, version: int) -> None:
-        meta_path = self.store / _META_FILE
-        payload: dict[str, Any] = {"format_version": version}
-        if meta_path.exists():
-            payload = json.loads(meta_path.read_text(encoding="utf-8"))
-            payload["format_version"] = version
-        else:
-            payload["created_at"] = pd.Timestamp.now().isoformat()
-        tmp = meta_path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(payload, indent=1), encoding="utf-8")
-        os.replace(tmp, meta_path)
+        lifecycle.refuse_non_archive_dir(self.store)
 
     def _check_or_init_store(self) -> int:
-        """Gate the format version; initialize a new store at the current one.
-
-        Returns the stored format version (``FORMAT_VERSION`` for a freshly
-        initialized store); versions below it are migrated later, once the
-        backend exists.
-        """
-        self._refuse_non_archive_dir()
-        stored_version = self._stored_format_version()
-        if stored_version is not None:
-            if stored_version == FORMAT_VERSION:
-                return stored_version
-            if stored_version > FORMAT_VERSION:
-                raise StoreFormatError(
-                    f"archive format version {stored_version} is newer than this "
-                    f"library supports ({FORMAT_VERSION}); upgrade foreledger "
-                    "to open this store"
-                )
-            if stored_version in (1, 2):
-                return stored_version
-            # only versions 1 and 2 have defined migrations; anything else
-            # older is an unknown layout we must not reinterpret or rewrite
-            raise StoreFormatError(
-                f"archive format version {stored_version} is not supported; "
-                "no migration is defined for it"
-            )
-        self.store.mkdir(parents=True, exist_ok=True)
-        # Mandatory metadata before the version marker: a crash in between
-        # leaves no metadata file, so the next constructor simply finishes
-        # the initialization. A healthy format-3 store therefore always has
-        # all three — an absence later is corruption, never emptiness.
-        if not self._actuals_manifest_path.exists():
-            ActualsManifest(path=self._actuals_manifest_path).save()
-        if not self._manifest_path.exists():
-            RunManifest(path=self._manifest_path).save()
-        if not self._integrity_path.exists():
-            SegmentIntegrity(path=self._integrity_path).save()
-        self._write_format_version(FORMAT_VERSION)
-        return FORMAT_VERSION
+        return lifecycle.check_or_init_store(
+            self.store,
+            self._manifest_path,
+            self._actuals_manifest_path,
+            self._integrity_path,
+        )
 
     def _manifest_file_key(self) -> tuple[int, int] | None:
-        """A cheap change marker (mtime_ns, size) for the manifest file."""
-        try:
-            stat = self._manifest_path.stat()
-        except FileNotFoundError:
-            return None
-        return (stat.st_mtime_ns, stat.st_size)
+        return file_key(self._manifest_path)
 
     def _current_manifest(self) -> RunManifest:
         """The manifest, reloaded if another handle has committed since this
@@ -290,12 +187,7 @@ class ForecastArchive:
         return self._manifest
 
     def _actuals_manifest_file_key(self) -> tuple[int, int] | None:
-        """A cheap change marker (mtime_ns, size) for the actuals manifest."""
-        try:
-            stat = self._actuals_manifest_path.stat()
-        except FileNotFoundError:
-            return None
-        return (stat.st_mtime_ns, stat.st_size)
+        return file_key(self._actuals_manifest_path)
 
     def _current_actuals_manifest(self) -> ActualsManifest:
         """The actuals manifest, reloaded if another handle has committed."""
@@ -318,76 +210,11 @@ class ForecastArchive:
         return ActualsManifest.load(self._actuals_manifest_path)
 
     def _migrate_v1_actuals_visibility(self) -> None:
-        """Format-1 → 2 step: adopt manifest-committed actuals visibility.
-
-        Format 1 had directory-scan visibility: adopt every actuals segment
-        (they were all visible), and adopt an officials segment only if its
-        designations dereference registered actuals — a dangling officials
-        file is the leftover of a failed pre-manifest call and must stay
-        inert. Caller holds the store lock; the version bump happens at the
-        end of the full migration chain.
-        """
-        if self._actuals_manifest_path.exists():
-            return
-        actuals_segments, officials_segments = self._backend.list_segments()
-        actuals = self._backend.read_actuals(actuals_segments)
-        identity = ["series_id", "target", "source", "actual_recorded_at"]
-        known = actuals[identity].drop_duplicates()
-        adopted_officials = []
-        for segment in officials_segments:
-            rows = self._backend.read_officials([segment])
-            live = rows.merge(known, on=identity, how="left", indicator=True)
-            if not rows.empty and (live["_merge"] == "both").all():
-                adopted_officials.append(segment)
-        manifest = ActualsManifest(
-            path=self._actuals_manifest_path,
-            actuals=actuals_segments,
-            officials=adopted_officials,
-        )
-        manifest.save()
-        logger.info(
-            "migrated format-1 actuals store: %d actuals segment(s), %d of %d "
-            "officials segment(s) adopted",
-            len(actuals_segments),
-            len(adopted_officials),
-            len(officials_segments),
-        )
+        lifecycle.migrate_v1_actuals_visibility(self._backend, self._actuals_manifest_path)
 
     def _migrate_to_v3(self) -> None:
-        """Final migration step: adopt integrity fingerprints and bump.
-
-        Every referenced segment — including superseded history, which the
-        append-only promise still protects — gets a fingerprint of its
-        current content. Adoption is migration-only: once at format 3, a
-        missing registry or fingerprint is corruption, never an implicit
-        authorization to trust whatever bytes are present. The version is
-        bumped last so an interrupted migration simply reruns. Caller holds
-        the store lock.
-        """
-        registry = (
-            SegmentIntegrity.load(self._integrity_path)
-            if self._integrity_path.exists()
-            else SegmentIntegrity(path=self._integrity_path)
-        )
-        tokens = self._referenced_tokens()
-        adopted = 0
-        for token in tokens:
-            if token not in registry.entries:
-                registry.entries[token] = {
-                    **self._backend.fingerprint_segment(token),
-                    "committed": True,
-                }
-                adopted += 1
-            else:
-                registry.entries[token]["committed"] = True
-        for stale in set(registry.entries) - set(tokens):
-            del registry.entries[stale]
-        registry.save()
-        self._write_format_version(FORMAT_VERSION)
-        logger.info(
-            "archive migrated to format version %d (%d fingerprint(s) adopted)",
-            FORMAT_VERSION,
-            adopted,
+        lifecycle.migrate_to_v3(
+            self.store, self._backend, self._integrity_path, self._referenced_tokens()
         )
 
     def _load_manifest(self) -> RunManifest:
@@ -403,74 +230,14 @@ class ForecastArchive:
         return RunManifest.from_entries(self._manifest_path, entries)
 
     def _migrate_legacy_manifest(self, entries: list[dict[str, Any]]) -> RunManifest:
-        """Deterministically migrate per-series-set run records (pre-57930cc)
-        to per-series records, preserving format version 1.
-
-        Each active legacy run's rows are re-tagged with per-series run_ids in
-        a new segment; the legacy segment files stay on disk (never deleted)
-        but are no longer referenced. Crash-safe: the manifest is replaced
-        atomically last, so an interrupted migration simply reruns.
-        """
-        legacy = [e for e in entries if "series_key" in e]
-        modern = [e for e in entries if "series_key" not in e]
-        required = ("run_id", "model_id", "model_version", "origin", "ingested_at", "segment")
-        for entry in legacy:
-            missing = [key for key in required if key not in entry]
-            if missing:
-                raise StoreFormatError(
-                    f"legacy run manifest record is missing fields {missing}; the "
-                    "manifest may be corrupt or written by an incompatible version"
-                )
-            # same canonical-token rule as modern records, BEFORE any backend
-            # access: a tampered legacy manifest must not be able to make the
-            # migration read Parquet files outside the archive
-            validate_forecast_segment_token(str(entry["segment"]), self._manifest_path)
-        records = RunManifest.from_entries(self._manifest_path, modern).runs
-
-        migrated: list[RunRecord] = []
-        tagged_frames: list[pd.DataFrame] = []
-        for entry in legacy:
-            if entry.get("superseded"):
-                continue  # invisible before the migration, invisible after
-            rows = self._backend.read_forecasts(
-                ForecastFilter(
-                    active_run_ids=[str(entry["run_id"])],
-                    segments=[str(entry["segment"])],
-                )
-            )
-            for series_id, group in rows.groupby("series_id", sort=True):
-                run_id = uuid.uuid4().hex
-                frame = group.copy()
-                frame["run_id"] = run_id
-                tagged_frames.append(frame)
-                migrated.append(
-                    RunRecord(
-                        run_id=run_id,
-                        model_id=str(entry["model_id"]),
-                        model_version=str(entry["model_version"]),
-                        origin=str(entry["origin"]),
-                        series_id=str(series_id),
-                        content_hash=content_hash(group),
-                        segment="",
-                        ingested_at=str(entry["ingested_at"]),
-                    )
-                )
-        if tagged_frames:
-            segment = self._backend.write_forecast_segment(
-                pd.concat(tagged_frames, ignore_index=True)
-            )
-            for record in migrated:
-                record.segment = segment
-            self._record_segment_integrity([segment], committed=True, create_if_missing=True)
-
-        manifest = RunManifest(path=self._manifest_path, runs=[*records, *migrated])
-        manifest.save()
-        logger.info(
-            "migrated %d legacy run record(s) to %d per-series record(s)",
-            len(legacy),
-            len(migrated),
+        return lifecycle.migrate_legacy_run_manifest(
+            self._backend,
+            self._manifest_path,
+            entries,
+            record_integrity=lambda tokens: self._record_segment_integrity(
+                tokens, committed=True, create_if_missing=True
+            ),
         )
-        return manifest
 
     # -- write surface -------------------------------------------------------
 
@@ -767,9 +534,7 @@ class ForecastArchive:
         with self._lock():
             champions = self.champions()  # re-read inside the lock: merge, not clobber
             champions[model_id] = model_version
-            tmp = self._champions_path.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(champions, indent=1), encoding="utf-8")
-            os.replace(tmp, self._champions_path)
+            atomic_write_json(self._champions_path, champions)
         logger.info("champion updated")
 
     def champions(self) -> dict[str, str]:
@@ -827,16 +592,6 @@ class ForecastArchive:
             digest.update(f"integrity:{token}:{registry.entries[token]['sha256']}\n".encode())
         return digest.hexdigest()
 
-    def _active_forecast_segments(self) -> list[str]:
-        """Segment tokens scanned by forecast reads: non-superseded runs only."""
-        return sorted(
-            {
-                run.segment
-                for run in self._current_manifest().runs
-                if not run.superseded and run.segment
-            }
-        )
-
     def _forecast_visibility(self) -> tuple[list[str], list[str]]:
         """Active (run_ids, segment tokens) from ONE manifest snapshot.
 
@@ -865,74 +620,21 @@ class ForecastArchive:
         )
 
     def _reconcile_integrity_records(self) -> None:
-        """Open-time journal reconciliation. Caller holds the store lock.
-
-        Three-way rule per registry entry:
-        - referenced by a manifest → it was committed; ensure the flag says so
-          (repairs the crash window between a manifest save and the flip);
-        - unreferenced and staged → the orphan of a failed write: prune;
-        - unreferenced and *committed* → the mutable manifests stopped
-          referencing committed history: corruption, never a prune. A
-          valid-looking but truncated ``runs.json``/``actuals_manifest.json``
-          can therefore never silently erase committed data.
-
-        Entries without the flag (older format-3 stores) are normalized:
-        referenced ones become committed, unreferenced ones prune as the old
-        semantics did.
-        """
-        registry = SegmentIntegrity.load(self._integrity_path)
-        referenced = set(self._referenced_tokens())
-        changed = False
-        for token, record in list(registry.entries.items()):
-            flag = record.get("committed")
-            if token in referenced:
-                if flag is not True:
-                    record["committed"] = True
-                    changed = True
-            elif flag is True:
-                raise StoreFormatError(
-                    f"visibility metadata no longer references committed segment "
-                    f"{token!r}; runs.json or actuals_manifest.json was modified "
-                    "externally"
-                )
-            else:
-                del registry.entries[token]
-                changed = True
-        if changed:
-            registry.save()
+        reconcile_journal(self._integrity_path, set(self._referenced_tokens()))
 
     def _record_segment_integrity(
         self, tokens: Sequence[str], *, committed: bool = False, create_if_missing: bool = False
     ) -> None:
-        """Fingerprint freshly written segments — called inside the store
-        lock, after the segment write and before the visibility commit
-        (staged), then flipped via :meth:`_mark_segments_committed` once the
-        commit succeeds. ``create_if_missing`` is reserved for migrations; at
-        format 3 a missing registry is corruption, never something a write
-        path may recreate."""
-        if not tokens:
-            return
-        if create_if_missing and not self._integrity_path.exists():
-            registry = SegmentIntegrity(path=self._integrity_path)
-        else:
-            registry = SegmentIntegrity.load(self._integrity_path)
-        for token in tokens:
-            registry.entries[token] = {
-                **self._backend.fingerprint_segment(token),
-                "committed": committed,
-            }
-        registry.save()
+        record_segments(
+            self._integrity_path,
+            self._backend.fingerprint_segment,
+            tokens,
+            committed=committed,
+            create_if_missing=create_if_missing,
+        )
 
     def _mark_segments_committed(self, tokens: Sequence[str]) -> None:
-        """Flip staged journal entries to committed, right after the
-        visibility commit succeeded (still under the store lock)."""
-        if not tokens:
-            return
-        registry = SegmentIntegrity.load(self._integrity_path)
-        for token in tokens:
-            if token in registry.entries:
-                registry.entries[token]["committed"] = True
-        registry.save()
+        mark_committed(self._integrity_path, tokens)
 
     def _verify_committed_segments(self) -> None:
         """Assert every referenced segment's data is present and unmodified.
@@ -1107,9 +809,7 @@ class ForecastArchive:
                     f"sources={list(conflict.sources)} values={list(conflict.values)}\n"
                 )
                 logged.add(conflict.key())
-        tmp = self._conflicts_logged_path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(sorted(logged)), encoding="utf-8")
-        os.replace(tmp, self._conflicts_logged_path)
+        atomic_write_json(self._conflicts_logged_path, sorted(logged), indent=None)
         logger.warning(
             "%d unresolved same-timestamp actual conflict(s) written to the error log",
             len(conflicts),

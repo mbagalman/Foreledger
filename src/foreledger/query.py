@@ -12,12 +12,19 @@ scope where nothing can be scored is ``insufficient``. Under
 never silently substituted — unless the caller opts into
 ``fallback="latest"``, which fills them from the latest value and flags them
 in the result.
+
+Each public call works against one :class:`_QuerySnapshot`: integrity is
+verified once, the manifest visibility pair is taken from one snapshot, and
+the actuals are read and resolved once — so a fan-out call (a curve, a
+comparison) does the expensive work once instead of once per point, and a
+concurrent writer can never make a single call see a mix of states.
 """
 
 from __future__ import annotations
 
 import math
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import pandas as pd
@@ -62,6 +69,23 @@ def _coverage_status(usable: bool, n_missing: int) -> Literal["ok", "partial", "
     return "partial" if n_missing > 0 else "ok"
 
 
+@dataclass
+class _QuerySnapshot:
+    """Per-public-call cache of everything expensive or consistency-critical.
+
+    Built after one integrity verification, from one manifest snapshot.
+    Lazy fields are populated at most once per call.
+    """
+
+    run_ids: list[str]
+    segments: list[str]
+    summary: pd.DataFrame | None = None
+    summary_loaded: bool = False
+    actuals: pd.DataFrame | None = None
+    officials: pd.DataFrame | None = None
+    effective: dict[tuple[str, str | None], pd.DataFrame] = field(default_factory=dict)
+
+
 class Evaluator:
     """Read-only evaluation over the backend seam, summary, and metrics."""
 
@@ -97,10 +121,32 @@ class Evaluator:
         # externally deleted data must never read as silently absent rows.
         self._integrity_check = integrity_check
 
-    # -- shared plumbing ---------------------------------------------------
+    # -- snapshot plumbing ---------------------------------------------------
+
+    def _snapshot(self) -> _QuerySnapshot:
+        self._integrity_check()
+        run_ids, segments = self._forecast_visibility()
+        return _QuerySnapshot(run_ids=run_ids, segments=segments)
+
+    def _summary(self, snap: _QuerySnapshot) -> pd.DataFrame | None:
+        if not snap.summary_loaded:
+            snap.summary = self._summary_provider()
+            snap.summary_loaded = True
+        return snap.summary
+
+    def _actuals(self, snap: _QuerySnapshot) -> pd.DataFrame:
+        if snap.actuals is None:
+            snap.actuals = self._actuals_provider()
+        return snap.actuals
+
+    def _officials(self, snap: _QuerySnapshot) -> pd.DataFrame:
+        if snap.officials is None:
+            snap.officials = self._officials_provider()
+        return snap.officials
 
     def _read_forecasts(
         self,
+        snap: _QuerySnapshot,
         *,
         horizon: int | None = None,
         model_id: str | None = None,
@@ -109,14 +155,12 @@ class Evaluator:
         period: Period = None,
         origin_max: pd.Timestamp | None = None,
     ) -> pd.DataFrame:
-        self._integrity_check()
         start, end = _parse_period(period)
         if origin_max is not None:
             end = origin_max if end is None else min(end, origin_max)
-        run_ids, segments = self._forecast_visibility()
         flt = ForecastFilter(
-            active_run_ids=run_ids,
-            segments=segments,
+            active_run_ids=snap.run_ids,
+            segments=snap.segments,
             model_id=model_id,
             model_version=model_version,
             series=_series_list(series),
@@ -126,8 +170,9 @@ class Evaluator:
         )
         return self._backend.read_forecasts(flt)
 
-    def _effective(self, basis: str, fallback: str | None) -> pd.DataFrame:
-        """Resolved actuals for a basis, with an ``is_fallback`` flag column."""
+    def _effective(self, snap: _QuerySnapshot, basis: str, fallback: str | None) -> pd.DataFrame:
+        """Resolved actuals for a basis, with an ``is_fallback`` flag column;
+        resolved once per public call and cached on the snapshot."""
         if basis not in ("latest", "official"):
             raise ValidationError("basis must be 'latest' or 'official'")
         if fallback not in (None, "latest"):
@@ -135,13 +180,18 @@ class Evaluator:
         if fallback is not None and basis != "official":
             raise ValidationError("fallback='latest' only applies to basis='official'")
 
-        actuals = self._actuals_provider()
-        latest = resolve_effective_latest(actuals, self._source_priority).latest.copy()
+        cache_key = (basis, fallback)
+        cached = snap.effective.get(cache_key)
+        if cached is not None:
+            return cached
+
+        latest = resolve_effective_latest(self._actuals(snap), self._source_priority).latest.copy()
         latest["is_fallback"] = False
         if basis == "latest":
+            snap.effective[cache_key] = latest
             return latest
 
-        official = resolve_effective_official(actuals, self._officials_provider()).copy()
+        official = resolve_effective_official(self._actuals(snap), self._officials(snap)).copy()
         official["is_fallback"] = False
         if fallback == "latest" and not latest.empty:
             merged = latest.merge(
@@ -153,10 +203,12 @@ class Evaluator:
             extra = merged[merged["_merge"] == "left_only"].drop(columns="_merge").copy()
             extra["is_fallback"] = True
             official = pd.concat([official, extra], ignore_index=True)
+        snap.effective[cache_key] = official
         return official
 
     def _evaluate_raw(
         self,
+        snap: _QuerySnapshot,
         *,
         horizon: int,
         metric: str,
@@ -168,13 +220,14 @@ class Evaluator:
         period: Period,
     ) -> AccuracyResult:
         forecasts = self._read_forecasts(
+            snap,
             horizon=horizon,
             model_id=model_id,
             model_version=model_version,
             series=series,
             period=period,
         )
-        effective = self._effective(basis, fallback)
+        effective = self._effective(snap, basis, fallback)
         merged = forecasts.merge(effective, on=["series_id", "target"], how="left")
         matched = merged["actual_value"].notna()
         pairs = merged[matched]
@@ -197,6 +250,7 @@ class Evaluator:
 
     def _summary_lookup(
         self,
+        snap: _QuerySnapshot,
         *,
         horizon: int,
         metric: str,
@@ -205,7 +259,7 @@ class Evaluator:
         model_version: str,
         series_cell: str,
     ) -> AccuracyResult | None:
-        stored = self._summary_provider()
+        stored = self._summary(snap)
         if stored is None or stored.empty:
             return None
         row = stored[
@@ -234,18 +288,18 @@ class Evaluator:
             served_from="summary",
         )
 
-    # -- public operations ---------------------------------------------------
-
-    def accuracy_at_horizon(
+    def _accuracy(
         self,
+        snap: _QuerySnapshot,
         h: int,
-        metric: str = "MAE",
-        basis: str = "latest",
-        fallback: str | None = None,
-        model_id: str | None = None,
-        model_version: str | None = None,
-        series: str | Sequence[str] | None = None,
-        period: Period = None,
+        *,
+        metric: str,
+        basis: str,
+        fallback: str | None,
+        model_id: str | None,
+        model_version: str | None,
+        series: str | Sequence[str] | None,
+        period: Period,
     ) -> AccuracyResult:
         self._registry.get(metric)  # raises UnknownMetricError early
         summary_servable = (
@@ -258,6 +312,7 @@ class Evaluator:
         if summary_servable:
             assert model_id is not None and model_version is not None
             result = self._summary_lookup(
+                snap,
                 horizon=h,
                 metric=metric,
                 basis=basis,
@@ -268,6 +323,7 @@ class Evaluator:
             if result is not None:
                 return result
         return self._evaluate_raw(
+            snap,
             horizon=h,
             metric=metric,
             basis=basis,
@@ -278,8 +334,9 @@ class Evaluator:
             period=period,
         )
 
-    def horizons_in_scope(
+    def _horizons(
         self,
+        snap: _QuerySnapshot,
         *,
         model_id: str | None = None,
         model_version: str | None = None,
@@ -287,74 +344,28 @@ class Evaluator:
         period: Period = None,
     ) -> list[int]:
         forecasts = self._read_forecasts(
-            model_id=model_id, model_version=model_version, series=series, period=period
+            snap, model_id=model_id, model_version=model_version, series=series, period=period
         )
         return sorted(int(h) for h in forecasts["horizon"].unique())
 
-    def accuracy_curve(
+    def _compare_at(
         self,
-        metric: str = "MAE",
-        basis: str = "latest",
-        fallback: str | None = None,
-        horizons: Sequence[int] | None = None,
-        model_id: str | None = None,
-        model_version: str | None = None,
-        series: str | Sequence[str] | None = None,
-        period: Period = None,
-    ) -> AccuracyCurve:
-        if horizons is None:
-            horizons = self.horizons_in_scope(
-                model_id=model_id, model_version=model_version, series=series, period=period
-            )
-        points = tuple(
-            self.accuracy_at_horizon(
-                h,
-                metric=metric,
-                basis=basis,
-                fallback=fallback,
-                model_id=model_id,
-                model_version=model_version,
-                series=series,
-                period=period,
-            )
-            for h in horizons
-        )
-        return AccuracyCurve(metric=metric, basis=basis, points=points)
-
-    def _champion_map(self, override: Mapping[str, str] | tuple[str, str] | None) -> dict[str, str]:
-        champions = dict(self._champions())
-        if override is None:
-            return champions
-        if isinstance(override, tuple):
-            if len(override) != 2:
-                raise ValidationError("champion must be a (model_id, model_version) pair")
-            champions[override[0]] = override[1]
-        else:
-            champions.update(dict(override))
-        return champions
-
-    def compare_models(
-        self,
+        snap: _QuerySnapshot,
         h: int,
         models: Sequence[tuple[str, str]],
-        metric: str = "MAE",
-        basis: str = "latest",
-        fallback: str | None = None,
-        champion: Mapping[str, str] | tuple[str, str] | None = None,
-        series: str | Sequence[str] | None = None,
-        period: Period = None,
-    ) -> pd.DataFrame:
-        """The metric per listed (model_id, model_version) at horizon ``h``
-        over a common scope; each value equals the scoped single-model call.
-        Versions whose model has a champion get a delta vs. that champion."""
-        if not models:
-            raise ValidationError("models must list at least one (model_id, model_version)")
-        champions = self._champion_map(champion)
-
+        champions: dict[str, str],
+        *,
+        metric: str,
+        basis: str,
+        fallback: str | None,
+        series: str | Sequence[str] | None,
+        period: Period,
+    ) -> list[dict[str, Any]]:
         champion_results: dict[str, AccuracyResult] = {}
 
         def scoped(mid: str, mv: str) -> AccuracyResult:
-            return self.accuracy_at_horizon(
+            return self._accuracy(
+                snap,
                 h,
                 metric=metric,
                 basis=basis,
@@ -391,6 +402,121 @@ class Evaluator:
                     "delta_vs_champion": delta,
                 }
             )
+        return rows
+
+    def _champion_map(self, override: Mapping[str, str] | tuple[str, str] | None) -> dict[str, str]:
+        champions = dict(self._champions())
+        if override is None:
+            return champions
+        if isinstance(override, tuple):
+            if len(override) != 2:
+                raise ValidationError("champion must be a (model_id, model_version) pair")
+            champions[override[0]] = override[1]
+        else:
+            champions.update(dict(override))
+        return champions
+
+    # -- public operations ---------------------------------------------------
+
+    def accuracy_at_horizon(
+        self,
+        h: int,
+        metric: str = "MAE",
+        basis: str = "latest",
+        fallback: str | None = None,
+        model_id: str | None = None,
+        model_version: str | None = None,
+        series: str | Sequence[str] | None = None,
+        period: Period = None,
+    ) -> AccuracyResult:
+        return self._accuracy(
+            self._snapshot(),
+            h,
+            metric=metric,
+            basis=basis,
+            fallback=fallback,
+            model_id=model_id,
+            model_version=model_version,
+            series=series,
+            period=period,
+        )
+
+    def horizons_in_scope(
+        self,
+        *,
+        model_id: str | None = None,
+        model_version: str | None = None,
+        series: str | Sequence[str] | None = None,
+        period: Period = None,
+    ) -> list[int]:
+        return self._horizons(
+            self._snapshot(),
+            model_id=model_id,
+            model_version=model_version,
+            series=series,
+            period=period,
+        )
+
+    def accuracy_curve(
+        self,
+        metric: str = "MAE",
+        basis: str = "latest",
+        fallback: str | None = None,
+        horizons: Sequence[int] | None = None,
+        model_id: str | None = None,
+        model_version: str | None = None,
+        series: str | Sequence[str] | None = None,
+        period: Period = None,
+    ) -> AccuracyCurve:
+        snap = self._snapshot()
+        if horizons is None:
+            horizons = self._horizons(
+                snap, model_id=model_id, model_version=model_version, series=series, period=period
+            )
+        points = tuple(
+            self._accuracy(
+                snap,
+                h,
+                metric=metric,
+                basis=basis,
+                fallback=fallback,
+                model_id=model_id,
+                model_version=model_version,
+                series=series,
+                period=period,
+            )
+            for h in horizons
+        )
+        return AccuracyCurve(metric=metric, basis=basis, points=points)
+
+    def compare_models(
+        self,
+        h: int,
+        models: Sequence[tuple[str, str]],
+        metric: str = "MAE",
+        basis: str = "latest",
+        fallback: str | None = None,
+        champion: Mapping[str, str] | tuple[str, str] | None = None,
+        series: str | Sequence[str] | None = None,
+        period: Period = None,
+    ) -> pd.DataFrame:
+        """The metric per listed (model_id, model_version) at horizon ``h``
+        over a common scope; each value equals the scoped single-model call.
+        Versions whose model has a champion get a delta vs. that champion."""
+        if not models:
+            raise ValidationError("models must list at least one (model_id, model_version)")
+        snap = self._snapshot()
+        rows = self._compare_at(
+            snap,
+            h,
+            models,
+            self._champion_map(champion),
+            metric=metric,
+            basis=basis,
+            fallback=fallback,
+            series=series,
+            period=period,
+        )
         return pd.DataFrame(rows)
 
     def compare_curve(
@@ -406,24 +532,30 @@ class Evaluator:
     ) -> pd.DataFrame:
         """One accuracy-vs-horizon curve per listed model/version (long form);
         each equals the scoped ``accuracy_curve``."""
+        if not models:
+            raise ValidationError("models must list at least one (model_id, model_version)")
+        snap = self._snapshot()
         if horizons is None:
-            horizons = self.horizons_in_scope(series=series, period=period)
-        frames = [
-            self.compare_models(
-                h,
-                models,
-                metric=metric,
-                basis=basis,
-                fallback=fallback,
-                champion=champion,
-                series=series,
-                period=period,
+            horizons = self._horizons(snap, series=series, period=period)
+        champions = self._champion_map(champion)
+        rows: list[dict[str, Any]] = []
+        for h in horizons:
+            rows.extend(
+                self._compare_at(
+                    snap,
+                    h,
+                    models,
+                    champions,
+                    metric=metric,
+                    basis=basis,
+                    fallback=fallback,
+                    series=series,
+                    period=period,
+                )
             )
-            for h in horizons
-        ]
-        if not frames:
+        if not rows:
             return pd.DataFrame()
-        return pd.concat(frames, ignore_index=True)
+        return pd.DataFrame(rows)
 
     def as_of(
         self,
@@ -439,7 +571,11 @@ class Evaluator:
         for past origins."""
         cutoff = to_timestamp(origin, "origin")
         forecasts = self._read_forecasts(
-            model_id=model_id, model_version=model_version, series=series, origin_max=cutoff
+            self._snapshot(),
+            model_id=model_id,
+            model_version=model_version,
+            series=series,
+            origin_max=cutoff,
         )
         return forecasts.drop(columns=["run_id"]).reset_index(drop=True)
 
@@ -453,14 +589,16 @@ class Evaluator:
         fallback = cell.get("fallback")
         series_cell = cell.get("series_id")
         series = None if series_cell in (None, ALL_SERIES) else str(series_cell)
+        snap = self._snapshot()
         forecasts = self._read_forecasts(
+            snap,
             horizon=int(cell["horizon"]),
             model_id=str(cell["model_id"]),
             model_version=str(cell["model_version"]),
             series=series,
             period=cell.get("period_range"),
         )
-        effective = self._effective(basis, fallback)
+        effective = self._effective(snap, basis, fallback)
         pairs = forecasts.merge(effective, on=["series_id", "target"], how="inner")
         pairs = pairs.sort_values(["series_id", "target"], kind="mergesort")
         columns = [
@@ -478,7 +616,7 @@ class Evaluator:
 
     def list_models(self) -> pd.DataFrame:
         """The (model_id, model_version) pairs present and their coverage."""
-        forecasts = self._read_forecasts()
+        forecasts = self._read_forecasts(self._snapshot())
         champions = self._champions()
         if forecasts.empty:
             return pd.DataFrame(

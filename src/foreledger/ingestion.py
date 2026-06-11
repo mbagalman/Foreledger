@@ -19,7 +19,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import re
 import uuid
 from collections.abc import Mapping
@@ -31,6 +30,7 @@ import numpy as np
 import pandas as pd
 
 from .errors import ValidationError
+from .jsonstore import atomic_write_json
 from .schema import compute_horizon, to_timestamp
 
 logger = logging.getLogger("foreledger.ingestion")
@@ -126,10 +126,7 @@ class RunManifest:
         return cls.from_entries(path, load_manifest_entries(path))
 
     def save(self) -> None:
-        payload = {"runs": [asdict(run) for run in self.runs]}
-        tmp = self.path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(payload, indent=1), encoding="utf-8")
-        os.replace(tmp, self.path)
+        atomic_write_json(self.path, {"runs": [asdict(run) for run in self.runs]})
 
     def active_run_ids(self) -> list[str]:
         return [run.run_id for run in self.runs if not run.superseded]
@@ -248,13 +245,21 @@ def canonicalize_forecasts(
 
 
 def content_hash(group: pd.DataFrame) -> str:
+    """Stable digest over a run's rows.
+
+    The payload format is persisted (hashes live in ``runs.json`` and drive
+    idempotency), so it must stay byte-identical across versions — a pinning
+    test guards it. Built as one joined payload rather than per-row digest
+    updates: same bytes, far fewer Python-level calls.
+    """
     ordered = group.sort_values(["series_id", "target"])
-    digest = hashlib.sha256()
-    for row_series, row_target, row_value in zip(
-        ordered["series_id"], ordered["target"], ordered["value"], strict=True
-    ):
-        digest.update(f"{row_series}\x1f{row_target.isoformat()}\x1f{row_value!r}\n".encode())
-    return digest.hexdigest()
+    payload = "".join(
+        f"{row_series}\x1f{row_target.isoformat()}\x1f{row_value!r}\n"
+        for row_series, row_target, row_value in zip(
+            ordered["series_id"], ordered["target"], ordered["value"], strict=True
+        )
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
 
 
 @dataclass(frozen=True)
