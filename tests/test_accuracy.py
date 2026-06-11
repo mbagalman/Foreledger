@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import numpy as np
 import pytest
 from tests.conftest import HORIZONS, MODELS, ORIGINS, SERIES, reference_mae
@@ -58,11 +60,36 @@ def test_official_basis_summary_and_raw_agree(populated: ForecastArchive) -> Non
     populated.register_actuals(official, source="official-feed", official=True)
 
     result = populated.accuracy_at_horizon(1, basis="official", model_id="beta", model_version="v1")
+    assert result.served_from == "summary"
+    # partial official coverage must be visible, not read as complete
+    assert result.n_missing_actuals > 0
     summary_file = populated.store / "summary" / "summary.parquet"
     summary_file.unlink()
     raw = populated.accuracy_at_horizon(1, basis="official", model_id="beta", model_version="v1")
-    assert raw.value == result.value
-    assert raw.n == result.n
+    assert raw.served_from == "raw"
+    assert dataclasses.replace(raw, served_from="summary") == result
+
+
+def test_routes_report_identical_results_under_partial_coverage(
+    populated: ForecastArchive,
+) -> None:
+    """The full result object — including missing-actuals metadata — must not
+    depend on whether the summary or the raw path served it."""
+    from tests.conftest import forecast_frame
+
+    # horizon-5 forecasts: targets run past the registered actuals, so
+    # coverage is genuinely partial (fresh version: a run's content is fixed)
+    populated.ingest(forecast_frame(1.0, horizons=[1, 5]), model_id="alpha", model_version="v9")
+    kwargs = {"metric": "MAE", "model_id": "alpha", "model_version": "v9"}
+    summary_res = populated.accuracy_at_horizon(5, **kwargs)
+    assert summary_res.served_from == "summary"
+    assert summary_res.status == "ok"
+    assert summary_res.n_missing_actuals > 0
+
+    (populated.store / "summary" / "summary.parquet").unlink()
+    raw_res = populated.accuracy_at_horizon(5, **kwargs)
+    assert raw_res.served_from == "raw"
+    assert dataclasses.replace(raw_res, served_from="summary") == summary_res
 
 
 def test_curve_equals_per_horizon_calls(populated: ForecastArchive) -> None:

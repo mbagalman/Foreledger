@@ -7,6 +7,8 @@ name = "foreledger"
 version = "0.1.0.dev0"
 description = "Foreledger — a durable, bitemporal archive of recurring forecast runs with horizon-keyed accuracy evaluation and cross-model/version comparison."
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 authors = [{ name = "Michael Bagalman", email = "michael@paradoxresolution.com" }]
 keywords = ["forecasting", "forecast-evaluation", "time-series", "duckdb", "parquet"]

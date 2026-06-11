@@ -1,9 +1,14 @@
 """Forecast ingestion: push with caller-supplied identity (ADR-005/ADR-006).
 
-Run identity is ``(model_id, model_version, origin, series-set)`` and is never
-inferred from content. Appends are all-or-nothing: segments are written
-invisibly first and become visible only when the run manifest commits, so a
-crash mid-ingest leaves the archive at its pre-run state.
+Run identity is ``(model_id, model_version, origin, series_id)`` and is never
+inferred from content. Identity at series granularity (rather than per
+series-*set*) is what guarantees grain uniqueness under partial replays:
+re-ingesting a subset of an earlier batch matches the existing per-series
+records instead of registering a second, overlapping run.
+
+Appends are all-or-nothing: a segment is written invisibly first and becomes
+visible only when the run manifest commits, so a crash mid-ingest leaves the
+archive at its pre-run state.
 
 This module owns the run-identity bookkeeping (the manifest) that makes
 re-ingestion idempotent and conflicts explicit.
@@ -19,8 +24,9 @@ import uuid
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
+import numpy as np
 import pandas as pd
 
 from .errors import ValidationError
@@ -33,13 +39,13 @@ _CANONICAL_INPUT = ("series_id", "target", "value")
 
 @dataclass
 class RunRecord:
-    """One committed run in the manifest."""
+    """One committed (model, version, origin, series) run in the manifest."""
 
     run_id: str
     model_id: str
     model_version: str
     origin: str
-    series_key: str
+    series_id: str
     content_hash: str
     segment: str
     ingested_at: str
@@ -47,7 +53,7 @@ class RunRecord:
 
     @property
     def identity(self) -> tuple[str, str, str, str]:
-        return (self.model_id, self.model_version, self.origin, self.series_key)
+        return (self.model_id, self.model_version, self.origin, self.series_id)
 
 
 @dataclass
@@ -106,6 +112,31 @@ def _resolve_mapping(
     return resolved
 
 
+def validate_series_ids(raw: pd.Series, frame_kind: str) -> pd.Series:
+    """Coerce series identifiers to non-empty strings; reject missing/blank.
+
+    Untrusted input: without this check ``astype(str)`` would mint phantom
+    series named ``"nan"``/``"None"`` into the permanent archive.
+    """
+    if raw.isna().any():
+        raise ValidationError(f"{frame_kind} series_id column contains missing values")
+    as_str = raw.astype(str).str.strip()
+    if (as_str == "").any():
+        raise ValidationError(f"{frame_kind} series_id column contains blank identifiers")
+    return as_str
+
+
+def validate_finite_values(raw: pd.Series, frame_kind: str) -> pd.Series:
+    """Coerce values to float64 and reject NaN/±inf — non-finite numbers in
+    the raw archive would poison every downstream metric."""
+    numeric = pd.to_numeric(raw, errors="raise").astype("float64")
+    if not np.isfinite(numeric.to_numpy()).all():
+        raise ValidationError(
+            f"{frame_kind} value column contains missing or non-finite values (NaN/inf)"
+        )
+    return numeric
+
+
 def canonicalize_forecasts(
     frame: pd.DataFrame,
     mapping: Mapping[str, str] | None,
@@ -136,17 +167,15 @@ def canonicalize_forecasts(
 
     canonical = pd.DataFrame(
         {
-            "series_id": frame[resolved["series_id"]].astype(str),
+            "series_id": validate_series_ids(frame[resolved["series_id"]], "forecast"),
             "target": normalize_datetimes(frame[resolved["target"]], "target"),
-            "value": pd.to_numeric(frame[resolved["value"]], errors="raise").astype("float64"),
+            "value": validate_finite_values(frame[resolved["value"]], "forecast"),
         }
     )
     if origin is None:
         canonical["origin"] = normalize_datetimes(frame[resolved["origin"]], "origin")
     else:
         canonical["origin"] = to_timestamp(origin, "origin")
-    if canonical["value"].isna().any():
-        raise ValidationError("value column contains missing values")
 
     canonical["model_id"] = model_id
     canonical["model_version"] = model_version
@@ -162,11 +191,6 @@ def canonicalize_forecasts(
             "requires uniqueness within a run"
         )
     return canonical.sort_values(["origin", "series_id", "target"]).reset_index(drop=True)
-
-
-def series_key(series_ids: pd.Series) -> str:
-    joined = "\x1f".join(sorted(series_ids.astype(str).unique()))
-    return hashlib.sha256(joined.encode("utf-8")).hexdigest()
 
 
 def content_hash(group: pd.DataFrame) -> str:
@@ -191,7 +215,6 @@ class IngestResult:
 
 @dataclass(frozen=True)
 class _PlannedRun:
-    origin: pd.Timestamp
     frame: pd.DataFrame
     identity: tuple[str, str, str, str]
     hash: str
@@ -203,12 +226,15 @@ def plan_runs(
     manifest: RunManifest,
     on_conflict: str,
 ) -> tuple[list[_PlannedRun], int]:
-    """Validate every run group against the manifest before anything is written.
+    """Validate every (origin, series) run against the manifest before
+    anything is written.
 
     Returns the runs to write and the count skipped as idempotent replays.
     Raises on a same-identity/different-values conflict under
     ``on_conflict="error"`` — before any side effect, keeping the whole call
-    all-or-nothing.
+    all-or-nothing. Because identity is per series, partial replays (subset,
+    superset, or overlapping series for the same origin) match the existing
+    per-series records and can never produce duplicate grain rows.
     """
     from .errors import IngestConflictError
 
@@ -217,17 +243,13 @@ def plan_runs(
 
     planned: list[_PlannedRun] = []
     skipped = 0
-    for origin_value, group in canonical.groupby("origin", sort=True):
-        origin_ts = (
-            pd.Timestamp(str(origin_value))
-            if not isinstance(origin_value, pd.Timestamp)
-            else origin_value
-        )
+    for (origin_value, series_id), group in canonical.groupby(["origin", "series_id"], sort=True):
+        origin_ts = pd.Timestamp(cast("Any", origin_value))
         identity = (
             str(group["model_id"].iloc[0]),
             str(group["model_version"].iloc[0]),
             origin_ts.isoformat(),
-            series_key(group["series_id"]),
+            str(series_id),
         )
         digest = content_hash(group)
         existing = manifest.find_active(identity)
@@ -242,7 +264,6 @@ def plan_runs(
             )
         planned.append(
             _PlannedRun(
-                origin=origin_ts,
                 frame=group.reset_index(drop=True),
                 identity=identity,
                 hash=digest,
@@ -258,29 +279,37 @@ def commit_runs(
     write_segment: Any,
     now: pd.Timestamp,
 ) -> IngestResult:
-    """Write planned segments invisibly, then commit visibility in one
-    atomic manifest save."""
+    """Write one invisible segment for the whole call, then commit visibility
+    in one atomic manifest save.
+
+    The segment file carries one ``run_id`` per planned (origin, series) run;
+    visibility is row-level via the manifest's active run_ids, so superseding
+    one series later never hides its neighbours in the same file.
+    """
     new_records: list[RunRecord] = []
-    n_rows = 0
+    tagged_frames: list[pd.DataFrame] = []
     for plan in planned:
         run_id = uuid.uuid4().hex
         frame = plan.frame.copy()
         frame["run_id"] = run_id
         frame["ingested_at"] = now
-        segment = write_segment(frame)
-        n_rows += len(frame)
+        tagged_frames.append(frame)
         new_records.append(
             RunRecord(
                 run_id=run_id,
                 model_id=plan.identity[0],
                 model_version=plan.identity[1],
                 origin=plan.identity[2],
-                series_key=plan.identity[3],
+                series_id=plan.identity[3],
                 content_hash=plan.hash,
-                segment=segment,
+                segment="",  # filled in below, one shared segment per call
                 ingested_at=now.isoformat(),
             )
         )
+
+    segment = write_segment(pd.concat(tagged_frames, ignore_index=True))
+    for record in new_records:
+        record.segment = segment
 
     superseded = 0
     for plan in planned:
@@ -290,6 +319,7 @@ def commit_runs(
     manifest.runs.extend(new_records)
     manifest.save()
 
+    n_rows = sum(len(frame) for frame in tagged_frames)
     logger.info(
         "ingest committed: %d run(s), %d row(s), %d superseded",
         len(new_records),

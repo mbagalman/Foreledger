@@ -37,8 +37,10 @@ signed off on — and Foreledger answers, instantly and reproducibly:
 
 1. **Accuracy by horizon** — a curve showing exactly how error grows the
    further out you predict, for any model, series, or time window.
-2. **Model vs. model** — fair, same-data comparisons across models and
-   versions, with deltas against your designated champion.
+2. **Model vs. model** — side-by-side comparisons across models and versions
+   over a common scope, with deltas against your designated champion. Every
+   row reports its own sample count and coverage, and each value provably
+   equals the corresponding single-model query — no hidden re-weighting.
 3. **What did we know when** — replay the forecast exactly as it stood on any
    past date, with no hindsight leaking in. The forecast that drove the March
    decision is one query away.
@@ -83,8 +85,10 @@ print(curve.to_frame())
   same-timestamp conflicts between feeds are resolved by your priority rules
   or flagged loudly, never picked silently.
 - **Built-in metrics** (MAE, RMSE, MAPE, MASE) plus a protocol for
-  registering your own — custom metrics run sandboxed so a buggy one can't
-  corrupt the archive.
+  registering your own — custom metrics run behind an error/timeout guard,
+  so one that crashes or hangs is skipped and quarantined rather than
+  corrupting a recompute. (Containment, not a security sandbox: registered
+  code runs in-process.)
 - **Champion/challenger workflow** — designate a champion per model and every
   comparison reports challenger deltas automatically.
 - **Drill-down provenance** — any headline accuracy number can be exploded
@@ -120,7 +124,7 @@ Contributor ground rules live in [AGENTS.md](AGENTS.md).
 
 ```bash
 pip install -e ".[dev]"
-pytest                 # 60 tests incl. atomicity, reconciliation, no-leakage
+pytest                 # incl. atomicity, reconciliation, replay, no-leakage tests
 ruff check . && ruff format --check .
 mypy src               # strict
 python examples/quickstart.py
@@ -132,3 +136,7 @@ Working MVP (Phases 1–4 of the [plan](docs/implementation-plan-forecast-archiv
 the full ingestion → actuals → evaluation surface described above, gated by CI.
 Next: packaging and PyPI release (Phase 5), then the Snowflake warehouse
 backend as v1.1 (Phase 6).
+
+## License
+
+[MIT](LICENSE).

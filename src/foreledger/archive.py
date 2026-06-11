@@ -12,6 +12,7 @@ Everything observable goes through this class; the modules behind it
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import logging
 import os
@@ -24,6 +25,7 @@ import pandas as pd
 from .actuals import (
     canonicalize_actuals,
     check_official_registration,
+    dedup_against_log,
     find_actual_row,
     resolve_effective_latest,
     resolve_effective_official,
@@ -96,6 +98,7 @@ class ForecastArchive:
             registry=self._registry,
             source_priority=self._source_priority,
             champions=self.champions,
+            summary_provider=self._valid_summary,
         )
 
     # -- store lifecycle ---------------------------------------------------
@@ -182,6 +185,9 @@ class ForecastArchive:
         planned, skipped = plan_runs(canonical, self._manifest, on_conflict)
         if not planned:
             logger.info("ingest was a no-op: %d run(s) already present", skipped)
+            # An idempotent replay is also the retry path after a failed
+            # summary refresh — repair the summary before returning.
+            self._refresh_summary_after_write()
             return IngestResult(
                 n_rows=0, n_runs_written=0, n_runs_skipped=skipped, n_runs_superseded=0
             )
@@ -191,7 +197,7 @@ class ForecastArchive:
             self._backend.write_forecast_segment,
             now=pd.Timestamp.now(),
         )
-        self.rebuild_summary()
+        self._refresh_summary_after_write()
         return dataclasses.replace(result, n_runs_skipped=skipped)
 
     def ingest_nixtla(
@@ -261,17 +267,23 @@ class ForecastArchive:
             value per target is simply the newest ``recorded_at``.
         """
         batch = canonicalize_actuals(frame, mapping, source, recorded_at, official)
+        # Enforce the (series, target, source, recorded_at) identity against
+        # the existing log: exact replays collapse, differing values raise —
+        # both before anything is appended.
+        new_rows = dedup_against_log(batch, self._backend.read_actuals())
         designations: pd.DataFrame | None = None
         if official:
+            # Designations reference the full canonical batch: a replayed row
+            # already in the log may still need its official designation.
             designations = check_official_registration(batch, self._backend.read_officials())
-        self._backend.append_actuals_segment(batch)
+        self._backend.append_actuals_segment(new_rows)
         if designations is not None and not designations.empty:
             designations = designations.copy()
             designations["designated_at"] = pd.Timestamp.now()
             self._backend.append_officials_segment(designations)
-        logger.info("registered %d actual(s)%s", len(batch), " as official" if official else "")
+        logger.info("registered %d actual(s)%s", len(new_rows), " as official" if official else "")
         self._log_new_conflicts()
-        self.rebuild_summary()
+        self._refresh_summary_after_write()
 
     def mark_official(
         self,
@@ -301,7 +313,7 @@ class ForecastArchive:
         )
         self._backend.append_officials_segment(designation)
         logger.info("official designation recorded")
-        self.rebuild_summary()
+        self._refresh_summary_after_write()
 
     def set_champion(self, model_id: str, model_version: str) -> None:
         """Persist the champion version for a model (one per model_id,
@@ -326,7 +338,7 @@ class ForecastArchive:
         """Register a custom metric per the protocol (ADR-004); summarizable
         metrics are precomputed into the summary like built-ins."""
         self._registry.register(name, fn, summarizable=summarizable)
-        self.rebuild_summary()
+        self._refresh_summary_after_write()
 
     # -- summary maintenance -------------------------------------------------
 
@@ -344,21 +356,68 @@ class ForecastArchive:
         official = resolve_effective_official(actuals, officials)
         return build_summary(forecasts, latest, official, self._registry)
 
+    def _state_token(self) -> str:
+        """Fingerprint of everything the summary is derived from: the active
+        run set, the stored actuals/officials, and the summarizable metric
+        set. A summary stamped with a different token is never served."""
+        digest = hashlib.sha256()
+        for run_id in sorted(self._manifest.active_run_ids()):
+            digest.update(f"run:{run_id}\n".encode())
+        for component in sorted(self._backend.raw_state_components()):
+            digest.update(f"{component}\n".encode())
+        for name in sorted(self._registry.names(summarizable_only=True)):
+            digest.update(f"metric:{name}\n".encode())
+        return digest.hexdigest()
+
+    def _valid_summary(self) -> pd.DataFrame | None:
+        """The stored summary, only if it matches the current raw state."""
+        stored = self._backend.read_summary()
+        if stored is None:
+            return None
+        frame, token = stored
+        if token != self._state_token() or "n_forecasts" not in frame.columns:
+            return None
+        return frame
+
     def rebuild_summary(self) -> None:
         """Recompute the disposable summary from raw and store it."""
-        self._backend.replace_summary(self._recompute_summary())
+        token = self._state_token()
+        self._backend.replace_summary(self._recompute_summary(), token)
+
+    def _refresh_summary_after_write(self) -> None:
+        """Eagerly refresh the summary after a raw write, without letting a
+        refresh failure fail the (already durable) write.
+
+        If the rebuild fails, the stored summary's token no longer matches the
+        raw state, so it is never served — queries fall back to raw, and the
+        next write or idempotent replay repairs it.
+        """
+        if self._valid_summary() is not None:
+            return
+        try:
+            self.rebuild_summary()
+        except Exception:
+            logger.warning(
+                "summary refresh failed; queries will compute from raw until the "
+                "next successful write",
+                exc_info=True,
+            )
 
     def reconcile(self) -> None:
         """Assert the stored summary equals a fresh recomputation from raw.
 
         Divergence is a defect (ADR-003); raises :class:`ReconciliationError`.
+        A summary that is merely absent or stale (e.g. after a crashed
+        refresh) is rebuilt instead — staleness is recoverable by design;
+        disagreement at the same raw state is not.
         """
         recomputed = self._recompute_summary()
-        stored = self._backend.read_summary()
+        stored = self._valid_summary()
         if stored is None:
-            if recomputed.empty:
-                return
-            raise ReconciliationError("summary is absent but raw data yields cells")
+            # absent or stale: rebuild rather than diagnose — it was never
+            # being served
+            self._backend.replace_summary(recomputed, self._state_token())
+            return
         key = [
             "actual_basis",
             "metric",

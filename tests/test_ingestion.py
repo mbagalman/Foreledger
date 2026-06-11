@@ -2,27 +2,37 @@
 
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 import pytest
-from tests.conftest import ORIGINS, forecast_frame
+from tests.conftest import ORIGINS, SERIES, forecast_frame
 
 from foreledger import ForecastArchive, IngestConflictError, ValidationError
+
+RUNS_PER_INGEST = len(ORIGINS) * len(SERIES)  # identity is per (origin, series)
 
 
 def total_rows(archive: ForecastArchive) -> int:
     return len(archive.as_of("2100-01-01"))
 
 
+def grain_is_unique(archive: ForecastArchive) -> bool:
+    rows = archive.as_of("2100-01-01")
+    return not rows.duplicated(
+        subset=["model_id", "model_version", "series_id", "origin", "target"]
+    ).any()
+
+
 def test_ingest_is_idempotent(archive: ForecastArchive) -> None:
     frame = forecast_frame(1.0)
     first = archive.ingest(frame, model_id="alpha", model_version="v1")
-    assert first.n_runs_written == len(ORIGINS)
+    assert first.n_runs_written == RUNS_PER_INGEST
     baseline = total_rows(archive)
 
     for _ in range(3):
         replay = archive.ingest(frame, model_id="alpha", model_version="v1")
         assert replay.n_runs_written == 0
-        assert replay.n_runs_skipped == len(ORIGINS)
+        assert replay.n_runs_skipped == RUNS_PER_INGEST
     assert total_rows(archive) == baseline
 
 
@@ -61,7 +71,7 @@ def test_on_conflict_overwrite_supersedes(archive: ForecastArchive) -> None:
     changed = frame.copy()
     changed["value"] = changed["value"] + 1.0
     result = archive.ingest(changed, model_id="alpha", model_version="v1", on_conflict="overwrite")
-    assert result.n_runs_superseded == len(ORIGINS)
+    assert result.n_runs_superseded == RUNS_PER_INGEST
     rows = archive.as_of("2100-01-01")
     assert len(rows) == len(frame)  # superseded runs invisible
     merged = rows.merge(changed, on=["series_id", "origin", "target"], suffixes=("", "_new"))
@@ -72,13 +82,9 @@ def test_crashed_ingest_leaves_pre_run_state(archive: ForecastArchive) -> None:
     frame = forecast_frame(1.0)
     backend = archive._backend
     original = backend.write_forecast_segment
-    calls = {"n": 0}
 
     def failing(segment: pd.DataFrame) -> str:
-        if calls["n"] >= 2:
-            raise RuntimeError("simulated crash mid-append")
-        calls["n"] += 1
-        return original(segment)
+        raise RuntimeError("simulated crash mid-append")
 
     backend.write_forecast_segment = failing  # type: ignore[method-assign]
     with pytest.raises(RuntimeError):
@@ -91,14 +97,79 @@ def test_crashed_ingest_leaves_pre_run_state(archive: ForecastArchive) -> None:
     # and the same ingest is re-runnable to completion
     backend.write_forecast_segment = original  # type: ignore[method-assign]
     result = archive.ingest(frame, model_id="alpha", model_version="v1")
-    assert result.n_runs_written == len(ORIGINS)
+    assert result.n_runs_written == RUNS_PER_INGEST
     assert total_rows(archive) == len(frame)
+
+
+def test_crash_between_segment_write_and_manifest_commit(archive: ForecastArchive) -> None:
+    frame = forecast_frame(1.0)
+    original_save = archive._manifest.save
+
+    def failing_save() -> None:
+        raise RuntimeError("simulated crash before visibility commit")
+
+    archive._manifest.save = failing_save  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError):
+        archive.ingest(frame, model_id="alpha", model_version="v1")
+
+    # the segment file exists on disk but was never committed: invisible
+    archive._manifest.runs.clear()  # drop in-memory records from the failed call
+    assert total_rows(archive) == 0
+
+    archive._manifest.save = original_save  # type: ignore[method-assign]
+    result = archive.ingest(frame, model_id="alpha", model_version="v1")
+    assert result.n_runs_written == RUNS_PER_INGEST
+    assert total_rows(archive) == len(frame)
+    assert grain_is_unique(archive)
+    archive.reconcile()
+
+
+def test_subset_replay_does_not_duplicate_grain(archive: ForecastArchive) -> None:
+    full = forecast_frame(1.0)  # series S1, S2, S3
+    archive.ingest(full, model_id="alpha", model_version="v1")
+    baseline = total_rows(archive)
+
+    subset = full[full["series_id"] == "S1"].reset_index(drop=True)
+    replay = archive.ingest(subset, model_id="alpha", model_version="v1")
+    assert replay.n_runs_written == 0
+    assert total_rows(archive) == baseline
+    assert grain_is_unique(archive)
+
+
+def test_superset_replay_adds_only_new_series(archive: ForecastArchive) -> None:
+    partial = forecast_frame(1.0, series=["S1", "S2"])
+    archive.ingest(partial, model_id="alpha", model_version="v1")
+
+    full = forecast_frame(1.0)  # adds S3; S1/S2 values identical
+    result = archive.ingest(full, model_id="alpha", model_version="v1")
+    assert result.n_runs_written == len(ORIGINS)  # only the S3 runs
+    assert result.n_runs_skipped == len(ORIGINS) * 2
+    assert total_rows(archive) == len(full)
+    assert grain_is_unique(archive)
+
+
+def test_overlapping_replay_with_changed_values_conflicts(archive: ForecastArchive) -> None:
+    archive.ingest(forecast_frame(1.0, series=["S1", "S2"]), model_id="alpha", model_version="v1")
+    changed = forecast_frame(1.0, series=["S2", "S3"])
+    changed.loc[changed["series_id"] == "S2", "value"] += 1.0
+
+    with pytest.raises(IngestConflictError):
+        archive.ingest(changed, model_id="alpha", model_version="v1")
+    assert grain_is_unique(archive)
+
+    # explicit overwrite supersedes only the overlapping series' runs
+    result = archive.ingest(changed, model_id="alpha", model_version="v1", on_conflict="overwrite")
+    assert result.n_runs_superseded == len(ORIGINS)  # the S2 runs
+    assert grain_is_unique(archive)
+    rows = archive.as_of("2100-01-01")
+    assert set(rows["series_id"]) == {"S1", "S2", "S3"}
+    archive.reconcile()
 
 
 def test_scalar_origin_kwarg(archive: ForecastArchive) -> None:
     one_run = forecast_frame(1.0, origins=ORIGINS[:1]).drop(columns=["origin"])
     result = archive.ingest(one_run, model_id="alpha", model_version="v1", origin=ORIGINS[0])
-    assert result.n_runs_written == 1
+    assert result.n_runs_written == len(SERIES)
     assert total_rows(archive) == len(one_run)
 
 
@@ -115,6 +186,22 @@ def test_duplicate_grain_rows_rejected(archive: ForecastArchive) -> None:
     doubled = pd.concat([frame, frame.assign(value=frame["value"] + 1)], ignore_index=True)
     with pytest.raises(ValidationError):
         archive.ingest(doubled, model_id="alpha", model_version="v1")
+
+
+@pytest.mark.parametrize("bad_series", [None, float("nan"), "", "   "])
+def test_missing_or_blank_series_ids_rejected(archive: ForecastArchive, bad_series: object) -> None:
+    frame = forecast_frame(1.0, origins=ORIGINS[:1], series=["S1"], horizons=[1])
+    frame.loc[0, "series_id"] = bad_series
+    with pytest.raises(ValidationError, match="series_id"):
+        archive.ingest(frame, model_id="alpha", model_version="v1")
+
+
+@pytest.mark.parametrize("bad_value", [float("nan"), np.inf, -np.inf, None])
+def test_non_finite_forecast_values_rejected(archive: ForecastArchive, bad_value: object) -> None:
+    frame = forecast_frame(1.0, origins=ORIGINS[:1], series=["S1"], horizons=[1])
+    frame.loc[0, "value"] = bad_value
+    with pytest.raises(ValidationError):
+        archive.ingest(frame, model_id="alpha", model_version="v1")
 
 
 def test_nixtla_adapter_equals_explicit_ingest(tmp_path: object) -> None:

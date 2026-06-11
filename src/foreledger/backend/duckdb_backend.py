@@ -9,6 +9,7 @@ crashed ingest leaves the archive at its pre-run state.
 
 from __future__ import annotations
 
+import json
 import os
 import uuid
 from pathlib import Path
@@ -88,10 +89,7 @@ class DuckDBBackend(Backend):
     # -- writes --------------------------------------------------------------
 
     def write_forecast_segment(self, frame: pd.DataFrame) -> str:
-        run_ids = frame["run_id"].unique()
-        if len(run_ids) != 1:
-            raise ValueError("a forecast segment must hold exactly one run")
-        path = self.forecasts_dir / f"{run_ids[0]}.parquet"
+        path = self.forecasts_dir / f"{uuid.uuid4().hex}.parquet"
         self._atomic_write(frame, path)
         return path.relative_to(self.store).as_posix()
 
@@ -105,8 +103,14 @@ class DuckDBBackend(Backend):
             return
         self._atomic_write(frame, self.officials_dir / f"{uuid.uuid4().hex}.parquet")
 
-    def replace_summary(self, frame: pd.DataFrame) -> None:
+    def replace_summary(self, frame: pd.DataFrame, state_token: str) -> None:
+        # Data first, token second: a crash in between leaves a mismatched
+        # token, so the half-replaced summary is never served.
         self._atomic_write(frame, self.summary_dir / "summary.parquet")
+        meta_path = self.summary_dir / "summary_meta.json"
+        tmp = meta_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({"state_token": state_token}), encoding="utf-8")
+        os.replace(tmp, meta_path)
 
     # -- reads ---------------------------------------------------------------
 
@@ -143,11 +147,22 @@ class DuckDBBackend(Backend):
         )
         return self._query(sql, [])
 
-    def read_summary(self) -> pd.DataFrame | None:
+    def read_summary(self) -> tuple[pd.DataFrame, str] | None:
         path = self.summary_dir / "summary.parquet"
-        if not path.exists():
+        meta_path = self.summary_dir / "summary_meta.json"
+        if not path.exists() or not meta_path.exists():
+            return None
+        try:
+            token = str(json.loads(meta_path.read_text(encoding="utf-8"))["state_token"])
+        except (ValueError, KeyError, json.JSONDecodeError):
             return None
         frame = pd.read_parquet(path)
         frame["horizon"] = frame["horizon"].astype("int64")
         frame["n"] = frame["n"].astype("int64")
-        return frame
+        return frame, token
+
+    def raw_state_components(self) -> list[str]:
+        return [
+            *(f"actuals:{name}" for name in self._files(self.actuals_dir)),
+            *(f"officials:{name}" for name in self._files(self.officials_dir)),
+        ]

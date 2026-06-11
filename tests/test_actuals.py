@@ -8,7 +8,7 @@ import pandas as pd
 import pytest
 from tests.conftest import ORIGINS, forecast_frame
 
-from foreledger import ForecastArchive, OfficialConflictError
+from foreledger import ForecastArchive, OfficialConflictError, ValidationError
 
 
 def one_target_frame(value: float) -> pd.DataFrame:
@@ -177,3 +177,49 @@ def test_missing_actuals_never_read_as_perfect_accuracy(archive: ForecastArchive
     assert result.value is None
     assert result.n == 0
     assert result.n_missing_actuals == 1
+
+
+def test_same_identity_different_value_rejected(archive: ForecastArchive) -> None:
+    """Re-registering an existing (series, target, source, recorded_at)
+    identity with a different value is rejected before any append."""
+    setup_forecasts(archive)
+    ts = "2026-02-01T12:00:00"
+    archive.register_actuals(one_target_frame(100.0), source="a", recorded_at=ts)
+    with pytest.raises(ValidationError, match="identity"):
+        archive.register_actuals(one_target_frame(120.0), source="a", recorded_at=ts)
+    rows = archive.drill(
+        {"model_id": "alpha", "model_version": "v1", "horizon": 1, "basis": "latest"}
+    )
+    assert rows["actual_value"].iloc[0] == 100.0
+
+
+def test_identical_replay_collapses(archive: ForecastArchive) -> None:
+    setup_forecasts(archive)
+    ts = "2026-02-01T12:00:00"
+    archive.register_actuals(one_target_frame(100.0), source="a", recorded_at=ts)
+    archive.register_actuals(one_target_frame(100.0), source="a", recorded_at=ts)  # replay
+    log = archive._backend.read_actuals()
+    assert len(log) == 1  # the replay appended nothing
+    assert mae_at_h1(archive).status == "ok"
+
+
+def test_official_cannot_hide_a_same_identity_conflict(archive: ForecastArchive) -> None:
+    """Review reproduction: two different official values at the exact same
+    identity must be rejected, not silently resolved to the first one."""
+    setup_forecasts(archive)
+    ts = "2026-02-01T12:00:00"
+    archive.register_actuals(one_target_frame(8.0), source="a", recorded_at=ts, official=True)
+    with pytest.raises(ValidationError):
+        archive.register_actuals(one_target_frame(20.0), source="a", recorded_at=ts, official=True)
+    rows = archive.drill(
+        {"model_id": "alpha", "model_version": "v1", "horizon": 1, "basis": "official"}
+    )
+    assert list(rows["actual_value"]) == [8.0]
+    assert mae_at_h1(archive, basis="official").status == "ok"
+
+
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_actual_values_rejected(archive: ForecastArchive, bad_value: float) -> None:
+    setup_forecasts(archive)
+    with pytest.raises(ValidationError):
+        archive.register_actuals(one_target_frame(bad_value))

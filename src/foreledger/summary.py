@@ -50,8 +50,12 @@ def build_summary(
     """Recompute the full summary from raw forecasts and resolved actuals.
 
     The ``latest`` basis is always materialized; ``official`` rows exist only
-    for targets with an official actual. Only summarizable metrics are
-    precomputed (ADR-004).
+    where at least one target has an official actual. Only summarizable
+    metrics are precomputed (ADR-004).
+
+    Each cell also stores ``n_forecasts`` — the total forecast rows in scope,
+    matched or not — so summary-served results report missing-actuals
+    coverage exactly as a raw computation would.
     """
     metric_names = registry.names(summarizable_only=True)
     records: list[dict[str, object]] = []
@@ -59,17 +63,18 @@ def build_summary(
     for basis, effective in (("latest", latest_effective), ("official", official_effective)):
         if forecasts.empty or effective.empty:
             continue
-        pairs = forecasts.merge(effective, on=["series_id", "target"], how="inner")
-        if pairs.empty:
-            continue
+        scoped = forecasts.merge(effective, on=["series_id", "target"], how="left")
         groupings: list[tuple[list[str], str | None]] = [
             (["model_id", "model_version", "series_id", "horizon"], None),
             (["model_id", "model_version", "horizon"], ALL_SERIES),
         ]
         for keys, pooled_series in groupings:
-            for group_key, group in pairs.groupby(keys, sort=True):
+            for group_key, group in scoped.groupby(keys, sort=True):
+                matched = group[group["actual_value"].notna()]
+                if matched.empty:
+                    continue
                 for metric in metric_names:
-                    value, n = metric_over_pairs(registry, metric, group)
+                    value, n = metric_over_pairs(registry, metric, matched)
                     if value is None:
                         continue
                     records.append(
@@ -85,6 +90,7 @@ def build_summary(
                             "actual_basis": basis,
                             "value": float(value),
                             "n": int(n),
+                            "n_forecasts": int(len(group)),
                         }
                     )
 

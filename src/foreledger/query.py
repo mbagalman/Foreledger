@@ -60,12 +60,17 @@ class Evaluator:
         registry: MetricRegistry,
         source_priority: list[str] | None,
         champions: Callable[[], dict[str, str]],
+        summary_provider: Callable[[], pd.DataFrame | None],
     ) -> None:
         self._backend = backend
         self._active_run_ids = active_run_ids
         self._registry = registry
         self._source_priority = source_priority
         self._champions = champions
+        # Returns the stored summary only when it matches the current raw
+        # state (validity token); a stale or absent summary yields None and
+        # every query falls back to raw computation invisibly.
+        self._summary_provider = summary_provider
 
     # -- shared plumbing ---------------------------------------------------
 
@@ -172,7 +177,7 @@ class Evaluator:
         model_version: str,
         series_cell: str,
     ) -> AccuracyResult | None:
-        stored = self._backend.read_summary()
+        stored = self._summary_provider()
         if stored is None or stored.empty:
             return None
         row = stored[
@@ -188,6 +193,7 @@ class Evaluator:
             return None
         value = float(row["value"].iloc[0])
         n = int(row["n"].iloc[0])
+        n_forecasts = int(row["n_forecasts"].iloc[0])
         ok = n > 0 and math.isfinite(value)
         return AccuracyResult(
             metric=metric,
@@ -196,6 +202,7 @@ class Evaluator:
             status="ok" if ok else "insufficient",
             value=value if ok else None,
             n=n,
+            n_missing_actuals=n_forecasts - n,
             served_from="summary",
         )
 

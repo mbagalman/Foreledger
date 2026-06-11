@@ -58,6 +58,7 @@ SUMMARY_COLUMNS = [
     "actual_basis",
     "value",
     "n",
+    "n_forecasts",
 ]
 
 
@@ -134,5 +135,6 @@ def empty_summary() -> pd.DataFrame:
             "actual_basis": pd.Series(dtype="object"),
             "value": pd.Series(dtype="float64"),
             "n": pd.Series(dtype="int64"),
+            "n_forecasts": pd.Series(dtype="int64"),
         }
     )

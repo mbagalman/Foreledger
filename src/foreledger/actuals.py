@@ -26,7 +26,12 @@ from typing import Any, cast
 import pandas as pd
 
 from .errors import OfficialConflictError, ValidationError
-from .ingestion import _resolve_mapping, normalize_datetimes
+from .ingestion import (
+    _resolve_mapping,
+    normalize_datetimes,
+    validate_finite_values,
+    validate_series_ids,
+)
 from .schema import DEFAULT_SOURCE, to_timestamp
 
 logger = logging.getLogger("foreledger.actuals")
@@ -56,15 +61,11 @@ def canonicalize_actuals(
     )
     canonical = pd.DataFrame(
         {
-            "series_id": frame[resolved["series_id"]].astype(str),
+            "series_id": validate_series_ids(frame[resolved["series_id"]], "actuals"),
             "target": normalize_datetimes(frame[resolved["target"]], "target"),
-            "actual_value": pd.to_numeric(frame[resolved["value"]], errors="raise").astype(
-                "float64"
-            ),
+            "actual_value": validate_finite_values(frame[resolved["value"]], "actuals"),
         }
     )
-    if canonical["actual_value"].isna().any():
-        raise ValidationError("actuals value column contains missing values")
     canonical["source"] = source if source is not None else DEFAULT_SOURCE
     canonical["actual_recorded_at"] = recorded_ts
     canonical["is_official"] = bool(official)
@@ -78,6 +79,39 @@ def canonicalize_actuals(
     # Equal-valued duplicates within the batch collapse silently.
     canonical = canonical.drop_duplicates(subset=["series_id", "target"]).reset_index(drop=True)
     return canonical.sort_values(["series_id", "target"]).reset_index(drop=True)
+
+
+_IDENTITY = ["series_id", "target", "source", "actual_recorded_at"]
+
+
+def dedup_against_log(batch: pd.DataFrame, existing: pd.DataFrame) -> pd.DataFrame:
+    """Enforce the actual identity ``(series, target, source, recorded_at)``
+    against the existing log before any append.
+
+    Rows that exactly repeat an existing identity *and* value collapse (a
+    replayed registration is a no-op). A different value at an existing
+    identity is rejected loudly — appending it would create two truths for
+    one identity, which downstream resolution could only pick between
+    silently. Register a revision with a new ``recorded_at`` (or another
+    ``source``) instead.
+    """
+    if existing.empty:
+        return batch
+    merged = batch.merge(
+        existing[_IDENTITY + ["actual_value"]].drop_duplicates(_IDENTITY),
+        on=_IDENTITY,
+        how="left",
+        suffixes=("", "_existing"),
+    )
+    seen = merged["actual_value_existing"].notna()
+    conflicting = seen & (merged["actual_value"] != merged["actual_value_existing"])
+    if conflicting.any():
+        raise ValidationError(
+            f"{int(conflicting.sum())} row(s) re-register an existing actual identity "
+            "(series, target, source, recorded_at) with a different value; register a "
+            "revision with a new recorded_at or source instead"
+        )
+    return batch[~seen.to_numpy()].reset_index(drop=True)
 
 
 @dataclass(frozen=True)
@@ -180,7 +214,20 @@ def resolve_effective_official(actuals: pd.DataFrame, officials: pd.DataFrame) -
         on=["series_id", "target", "source", "actual_recorded_at"],
         how="inner",
     )
-    joined = joined.drop_duplicates(subset=["series_id", "target"])
+    # Registration rejects differing values at one identity, so a designation
+    # should dereference exactly one value. Defend old/foreign stores anyway:
+    # a multi-valued dereference is excluded (insufficient downstream), never
+    # silently picked.
+    joined = joined.drop_duplicates(subset=["series_id", "target", "actual_value"])
+    counts = joined.groupby(["series_id", "target"])["actual_value"].transform("size")
+    conflicted = counts > 1
+    if conflicted.any():
+        logger.warning(
+            "%d official designation(s) dereference conflicting values; "
+            "excluded from the official basis",
+            int(joined[conflicted].drop_duplicates(["series_id", "target"]).shape[0]),
+        )
+        joined = joined[~conflicted]
     return joined[["series_id", "target", "actual_value"]].reset_index(drop=True)
 
 

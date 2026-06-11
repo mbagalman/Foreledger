@@ -7,7 +7,10 @@ MASE) are implemented *as* protocol-conforming metrics — one code path.
 Metrics registered with ``summarizable=True`` are precomputed into the
 accuracy summary like built-ins; others compute over raw only. Registered
 user code runs behind an error/timeout guard so a bad metric cannot corrupt
-or hang a recompute.
+or hang a recompute: a raising metric skips its cell, and a metric that
+exceeds the timeout is skipped and quarantined for the session. This is
+failure containment, not a security sandbox — registered code runs
+in-process with the caller's privileges.
 
 MASE note: the denominator is the in-window naive (lag-1) absolute error of
 the actuals, computed over the aligned pairs in target order. When a scope
@@ -18,8 +21,8 @@ per series/period for the textbook reading.
 
 from __future__ import annotations
 
-import concurrent.futures
 import logging
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -104,6 +107,10 @@ class MetricRegistry:
 
     def __init__(self, timeout: float = DEFAULT_METRIC_TIMEOUT) -> None:
         self._timeout = timeout
+        # A metric that times out once is quarantined for the rest of the
+        # session: Python cannot kill its (daemonized, leaked) thread, so the
+        # only safe containment is to never start another one.
+        self._quarantined: set[str] = set()
         self._metrics: dict[str, RegisteredMetric] = {
             name: RegisteredMetric(name, fn, summarizable=True, builtin=True)
             for name, fn in BUILTIN_SIMPLE.items()
@@ -119,6 +126,7 @@ class MetricRegistry:
         if name in self._metrics and self._metrics[name].builtin:
             raise ValidationError(f"cannot replace built-in metric {name!r}")
         self._metrics[name] = RegisteredMetric(name, fn, summarizable=summarizable, builtin=False)
+        self._quarantined.discard(name)
         logger.info("registered metric (summarizable=%s)", summarizable)
 
     def get(self, name: str) -> RegisteredMetric:
@@ -142,27 +150,46 @@ class MetricRegistry:
         """Evaluate a metric over aligned arrays.
 
         Built-ins run inline. Registered user metrics run behind an
-        error-isolation/timeout guard: a raising or hanging metric yields
-        ``None`` (the cell is skipped) instead of corrupting the recompute.
+        error/timeout guard: a raising metric yields ``None`` (the cell is
+        skipped); one that exceeds the timeout is skipped *and quarantined*
+        for the rest of the session so a hung cell cannot multiply.
+
+        This is failure containment, not a security sandbox: registered code
+        runs in-process with the caller's privileges, and a hung metric's
+        daemon thread keeps running until the process exits (it cannot block
+        interpreter shutdown, but it is not killed either).
         """
         metric = self.get(name)
         if len(forecast) == 0:
+            return None
+        if name in self._quarantined:
             return None
         fn = metric.fn
         if metric.builtin and name == "MASE":
             fn = make_mase(series_codes)
         if metric.builtin:
             return fn(forecast, actual)
-        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        try:
-            future = pool.submit(fn, forecast, actual)
-            return float(future.result(timeout=self._timeout))
-        except concurrent.futures.TimeoutError:
-            logger.warning("registered metric timed out after %.1fs; cell skipped", self._timeout)
+
+        outcome: list[float] = []
+        failure: list[BaseException] = []
+
+        def runner() -> None:
+            try:
+                outcome.append(float(fn(forecast, actual)))
+            except BaseException as exc:  # noqa: BLE001 - isolating user code
+                failure.append(exc)
+
+        worker = threading.Thread(target=runner, daemon=True, name=f"foreledger-metric-{name}")
+        worker.start()
+        worker.join(self._timeout)
+        if worker.is_alive():
+            self._quarantined.add(name)
+            logger.warning(
+                "registered metric timed out after %.1fs; quarantined for this session",
+                self._timeout,
+            )
             return None
-        except Exception:
-            logger.warning("registered metric raised; cell skipped", exc_info=True)
+        if failure:
+            logger.warning("registered metric raised; cell skipped", exc_info=failure[0])
             return None
-        finally:
-            # Never wait on a possibly-hung user metric thread.
-            pool.shutdown(wait=False, cancel_futures=True)
+        return outcome[0] if outcome else None

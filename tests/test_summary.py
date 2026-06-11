@@ -1,4 +1,4 @@
-"""Summary invariants: reconciliation, rebuildability, metric protocol."""
+"""Summary invariants: reconciliation, rebuildability, validity, metric protocol."""
 
 from __future__ import annotations
 
@@ -13,21 +13,26 @@ from foreledger import ForecastArchive, ReconciliationError, ValidationError
 from foreledger.metrics import FloatArray
 
 
+def stored_summary(archive: ForecastArchive) -> pd.DataFrame:
+    """The stored summary frame (must exist and be valid for current raw state)."""
+    frame = archive._valid_summary()
+    assert frame is not None
+    return frame
+
+
 def test_reconciliation_passes_for_both_bases(populated: ForecastArchive) -> None:
     # give the official basis some cells too
     populated.register_actuals(actuals_frame().head(6), source="official-feed", official=True)
     populated.reconcile()
-    stored = populated._backend.read_summary()
-    assert stored is not None
+    stored = stored_summary(populated)
     assert set(stored["actual_basis"]) == {"latest", "official"}
 
 
 def test_reconcile_detects_divergence(populated: ForecastArchive) -> None:
-    stored = populated._backend.read_summary()
-    assert stored is not None and not stored.empty
+    stored = stored_summary(populated)
     tampered = stored.copy()
     tampered.loc[0, "value"] = tampered.loc[0, "value"] + 1.0
-    populated._backend.replace_summary(tampered)
+    populated._backend.replace_summary(tampered, populated._state_token())
     with pytest.raises(ReconciliationError):
         populated.reconcile()
     populated.rebuild_summary()
@@ -36,13 +41,51 @@ def test_reconcile_detects_divergence(populated: ForecastArchive) -> None:
 
 def test_summary_recomputed_eagerly_on_writes(archive: ForecastArchive) -> None:
     archive.ingest(forecast_frame(1.0), model_id="alpha", model_version="v1")
-    stored = archive._backend.read_summary()
-    assert stored is not None and stored.empty  # forecasts but no actuals yet
+    stored = stored_summary(archive)
+    assert stored.empty  # forecasts but no actuals yet
 
     archive.register_actuals(actuals_frame())
-    stored = archive._backend.read_summary()
-    assert stored is not None and not stored.empty
+    stored = stored_summary(archive)
+    assert not stored.empty
     archive.reconcile()
+
+
+def test_failed_summary_refresh_recovers_on_retry(archive: ForecastArchive) -> None:
+    """A summary-refresh failure after the durable commit must not corrupt
+    anything: the stale summary is never served, queries fall back to raw,
+    and an idempotent replay repairs the summary."""
+    frame = forecast_frame(1.0)
+    archive.ingest(frame, model_id="alpha", model_version="v1")
+    archive.register_actuals(actuals_frame())
+    populated_value = archive.accuracy_at_horizon(1, model_id="alpha", model_version="v1")
+
+    backend = archive._backend
+    original = backend.replace_summary
+
+    def failing(summary: pd.DataFrame, token: str) -> None:
+        raise RuntimeError("simulated summary write failure")
+
+    backend.replace_summary = failing  # type: ignore[method-assign]
+    second = forecast_frame(0.5)
+    result = archive.ingest(second, model_id="alpha", model_version="v2")
+    # the write itself is durable and reported as success
+    assert result.n_runs_written > 0
+    # the (now stale) stored summary is not served; raw fallback is correct
+    after_failure = archive.accuracy_at_horizon(1, model_id="alpha", model_version="v1")
+    assert after_failure.served_from == "raw"
+    assert after_failure.value == populated_value.value
+    new_model = archive.accuracy_at_horizon(1, model_id="alpha", model_version="v2")
+    assert new_model.status == "ok"
+
+    # an idempotent replay repairs the summary
+    backend.replace_summary = original  # type: ignore[method-assign]
+    replay = archive.ingest(second, model_id="alpha", model_version="v2")
+    assert replay.n_runs_written == 0
+    archive.reconcile()
+    assert (
+        archive.accuracy_at_horizon(1, model_id="alpha", model_version="v2").served_from
+        == "summary"
+    )
 
 
 def test_registered_summarizable_metric_is_precomputed(populated: ForecastArchive) -> None:
@@ -82,7 +125,7 @@ def test_bad_registered_metric_cannot_corrupt_recompute(populated: ForecastArchi
     assert broken_result.status == "insufficient"
 
 
-def test_hanging_registered_metric_times_out(tmp_path: object) -> None:
+def test_hanging_registered_metric_times_out_and_is_quarantined(tmp_path: object) -> None:
     from pathlib import Path
 
     archive = ForecastArchive(Path(str(tmp_path)) / "store", metric_timeout=0.1)
@@ -97,8 +140,14 @@ def test_hanging_registered_metric_times_out(tmp_path: object) -> None:
     archive.register_metric("Hang", hanging, summarizable=True)
     result = archive.accuracy_at_horizon(1, metric="Hang", model_id="alpha", model_version="v1")
     assert result.status == "insufficient"
-    # the recompute did not hang for the full sleep of every cell
-    assert time.monotonic() - started < 3.0
+    # the first timeout quarantines the metric: the rebuild pays the timeout
+    # once, not once per cell
+    assert time.monotonic() - started < 1.5
+    # built-ins are unaffected
+    assert (
+        archive.accuracy_at_horizon(1, metric="MAE", model_id="alpha", model_version="v1").status
+        == "ok"
+    )
 
 
 def test_builtin_metrics_cannot_be_replaced(populated: ForecastArchive) -> None:
@@ -107,8 +156,7 @@ def test_builtin_metrics_cannot_be_replaced(populated: ForecastArchive) -> None:
 
 
 def test_summary_grain_includes_model_and_version(populated: ForecastArchive) -> None:
-    stored = populated._backend.read_summary()
-    assert stored is not None
+    stored = stored_summary(populated)
     pairs = set(zip(stored["model_id"], stored["model_version"], strict=True))
     assert ("alpha", "v1") in pairs and ("alpha", "v2") in pairs and ("beta", "v1") in pairs
     # parallel versions of the same model coexist at the same horizon
@@ -136,11 +184,10 @@ def test_late_actuals_fan_out_into_summary(archive: ForecastArchive) -> None:
 
 def test_summary_is_never_authoritative_over_raw(populated: ForecastArchive) -> None:
     # poison the summary; raw recomputation (reconcile) must surface it
-    stored = populated._backend.read_summary()
-    assert stored is not None
+    stored = stored_summary(populated)
     poisoned = stored.copy()
     poisoned["value"] = 0.0
-    populated._backend.replace_summary(poisoned)
+    populated._backend.replace_summary(poisoned, populated._state_token())
     with pytest.raises(ReconciliationError):
         populated.reconcile()
 

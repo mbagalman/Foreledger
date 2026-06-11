@@ -12,7 +12,10 @@
       "PowerShell(gh run watch \\(gh run list --repo mbagalman/Foreledger --limit 1 --json databaseId --jq '.[0].databaseId'\\) --repo mbagalman/Foreledger --exit-status 2>&1 | Select-Object -Last 6)",
       "PowerShell(gh run view \\(gh run list --repo mbagalman/Foreledger --limit 1 --json databaseId --jq '.[0].databaseId'\\) --repo mbagalman/Foreledger --log-failed 2>&1 | Select-String -Pattern \"FAILED|error|assert|Error\" | Select-Object -First 20)",
       "PowerShell(gh run view \\(gh run list --repo mbagalman/Foreledger --limit 1 --json databaseId --jq '.[0].databaseId'\\) --repo mbagalman/Foreledger --log-failed 2>&1 | Select-String -Pattern \"FAILED|E  |error\" | Select-Object -First 20)",
-      "PowerShell(gh run list --repo mbagalman/Foreledger --limit 1)"
+      "PowerShell(gh run list --repo mbagalman/Foreledger --limit 1)",
+      "PowerShell(\"ok\")",
+      "PowerShell(\\(Get-Content tests\\\\test_summary.py | Measure-Object -Line\\).Lines)",
+      "PowerShell(pytest -q 2>&1 | Select-Object -Last 3; ruff check . 2>&1 | Select-Object -Last 3; ruff format . 2>&1 | Select-Object -Last 1; mypy src 2>&1 | Select-Object -Last 2; python examples/quickstart.py | Out-Null; \"quickstart exit=$LASTEXITCODE\"; python scripts/check_doc_links.py; python scripts/check_quickstart_doc.py 2>&1 | Select-Object -Last 1)"
     ]
   }
 }

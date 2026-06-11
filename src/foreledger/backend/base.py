@@ -96,9 +96,10 @@ class Backend(ABC):
 
     @abstractmethod
     def write_forecast_segment(self, frame: pd.DataFrame) -> str:
-        """Persist one run's rows atomically; invisible until its run_id is
-        activated in the run manifest. Returns a storage token for the
-        segment (e.g. a relative file path)."""
+        """Persist one ingest call's rows atomically (the frame may carry
+        several run_ids); invisible until those run_ids are activated in the
+        run manifest. Returns a storage token for the segment (e.g. a
+        relative file path)."""
 
     @abstractmethod
     def append_actuals_segment(self, frame: pd.DataFrame) -> None:
@@ -109,8 +110,11 @@ class Backend(ABC):
         """Append official-designation rows atomically (append-only log)."""
 
     @abstractmethod
-    def replace_summary(self, frame: pd.DataFrame) -> None:
-        """Replace the disposable accuracy summary atomically."""
+    def replace_summary(self, frame: pd.DataFrame, state_token: str) -> None:
+        """Replace the disposable accuracy summary atomically, stamped with
+        the raw-state token it was computed from. The summary data is written
+        before the token, so a crash in between leaves a stale token — and a
+        summary with a stale token is simply never served."""
 
     # -- reads -----------------------------------------------------------
 
@@ -127,5 +131,12 @@ class Backend(ABC):
         """Read the official-designation log."""
 
     @abstractmethod
-    def read_summary(self) -> pd.DataFrame | None:
-        """Read the stored summary, or None if absent (rebuildable)."""
+    def read_summary(self) -> tuple[pd.DataFrame, str] | None:
+        """Read the stored summary and its raw-state token, or None if absent
+        (the summary is always rebuildable from raw)."""
+
+    @abstractmethod
+    def raw_state_components(self) -> list[str]:
+        """Opaque strings that change whenever stored actuals/officials
+        change (e.g. segment names). Combined with the manifest's active
+        run_ids they form the raw-state token that gates summary validity."""
