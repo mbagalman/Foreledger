@@ -93,10 +93,18 @@ class ForecastArchive:
         metric_timeout: float = DEFAULT_METRIC_TIMEOUT,
     ) -> None:
         self.store = Path(store)
-        self._check_or_init_store()
+        # cheap refusal before creating anything (incl. the lock file) inside
+        # a directory that is not ours
+        self._refuse_non_archive_dir()
+        self.store.mkdir(parents=True, exist_ok=True)
+        with self._lock():
+            # serialized: concurrent constructors of a new store would race
+            # on the shared metadata temp file otherwise
+            self._check_or_init_store()
         self._backend: Backend = create_backend(backend, self.store)
         self._manifest_path = self.store / "runs.json"
         self._manifest = self._load_manifest()
+        self._manifest_key = self._manifest_file_key()
         self._champions_path = self.store / "champions.json"
         self._conflicts_logged_path = self.store / "conflicts_logged.json"
         self._error_log = (
@@ -106,8 +114,8 @@ class ForecastArchive:
         self._registry = MetricRegistry(timeout=metric_timeout)
         self._evaluator = Evaluator(
             backend=self._backend,
-            # late-bound: writes replace self._manifest with a fresh snapshot
-            active_run_ids=lambda: self._manifest.active_run_ids(),
+            # late-bound and freshness-checked: reads see other handles' commits
+            active_run_ids=lambda: self._current_manifest().active_run_ids(),
             registry=self._registry,
             source_priority=self._source_priority,
             champions=self.champions,
@@ -122,17 +130,32 @@ class ForecastArchive:
 
     # -- store lifecycle ---------------------------------------------------
 
+    def _foreign_entries(self) -> bool:
+        """True when the store directory holds anything that is not ours.
+
+        The lock file and in-flight ``.tmp`` files are archive plumbing, not
+        user content — concurrent constructors may legitimately observe them
+        before the metadata lands.
+        """
+        return any(
+            entry.name != ".foreledger.lock" and not entry.name.endswith(".tmp")
+            for entry in self.store.iterdir()
+        )
+
+    def _refuse_non_archive_dir(self) -> None:
+        if not self.store.exists():
+            return
+        if not self.store.is_dir():
+            raise StoreFormatError(f"store path {self.store} is not a directory")
+        if self._foreign_entries() and not (self.store / _META_FILE).exists():
+            raise StoreFormatError(
+                f"{self.store} is not empty and has no archive metadata; refusing "
+                "to initialize over existing contents"
+            )
+
     def _check_or_init_store(self) -> None:
         meta_path = self.store / _META_FILE
-        if self.store.exists():
-            if not self.store.is_dir():
-                raise StoreFormatError(f"store path {self.store} is not a directory")
-            has_entries = any(self.store.iterdir())
-            if has_entries and not meta_path.exists():
-                raise StoreFormatError(
-                    f"{self.store} is not empty and has no archive metadata; refusing "
-                    "to initialize over existing contents"
-                )
+        self._refuse_non_archive_dir()
         if meta_path.exists():
             try:
                 meta = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -156,6 +179,24 @@ class ForecastArchive:
         tmp = meta_path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload, indent=1), encoding="utf-8")
         os.replace(tmp, meta_path)
+
+    def _manifest_file_key(self) -> tuple[int, int] | None:
+        """A cheap change marker (mtime_ns, size) for the manifest file."""
+        try:
+            stat = self._manifest_path.stat()
+        except FileNotFoundError:
+            return None
+        return (stat.st_mtime_ns, stat.st_size)
+
+    def _current_manifest(self) -> RunManifest:
+        """The manifest, reloaded if another handle has committed since this
+        one last read it — long-lived handles must not serve superseded or
+        incomplete run sets indefinitely."""
+        key = self._manifest_file_key()
+        if key != self._manifest_key:
+            self._manifest = RunManifest.load(self._manifest_path)
+            self._manifest_key = key
+        return self._manifest
 
     def _load_manifest(self) -> RunManifest:
         """Load the run manifest, migrating legacy (per series-set) records.
@@ -183,6 +224,14 @@ class ForecastArchive:
         """
         legacy = [e for e in entries if "series_key" in e]
         modern = [e for e in entries if "series_key" not in e]
+        required = ("run_id", "model_id", "model_version", "origin", "ingested_at")
+        for entry in legacy:
+            missing = [key for key in required if key not in entry]
+            if missing:
+                raise StoreFormatError(
+                    f"legacy run manifest record is missing fields {missing}; the "
+                    "manifest may be corrupt or written by an incompatible version"
+                )
         records = RunManifest.from_entries(self._manifest_path, modern).runs
 
         migrated: list[RunRecord] = []
@@ -274,6 +323,7 @@ class ForecastArchive:
             # plan against a fresh snapshot so concurrent handles merge
             # instead of clobbering each other's committed runs
             self._manifest = RunManifest.load(self._manifest_path)
+            self._manifest_key = self._manifest_file_key()
             planned, skipped = plan_runs(canonical, self._manifest, on_conflict)
             if not planned:
                 logger.info("ingest was a no-op: %d run(s) already present", skipped)
@@ -292,6 +342,7 @@ class ForecastArchive:
             # swap only after the durable save succeeded; a failed commit
             # leaves this handle's view at its pre-call state
             self._manifest = committed
+            self._manifest_key = self._manifest_file_key()
         self._refresh_summary_after_write()
         return dataclasses.replace(result, n_runs_skipped=skipped)
 
@@ -360,6 +411,13 @@ class ForecastArchive:
             Knowledge timestamp for the batch; defaults to now. Earlier
             registrations are never overwritten — the effective ``latest``
             value per target is simply the newest ``recorded_at``.
+
+        Notes
+        -----
+        For retry-safe pipelines pass an explicit ``recorded_at``: a retried
+        call is then an exact replay (no-op for rows already appended, and it
+        completes a half-finished official registration). With the default
+        ``recorded_at=now`` each attempt is a new revision.
         """
         batch = canonicalize_actuals(frame, mapping, source, recorded_at, official)
         with self._lock():
@@ -367,20 +425,31 @@ class ForecastArchive:
             # against the existing log: exact replays collapse, differing
             # values raise — both before anything is appended.
             new_rows = dedup_against_log(batch, self._backend.read_actuals())
-            designations: pd.DataFrame | None = None
             if official:
                 # Designations reference the full canonical batch: a replayed
                 # row already in the log may still need its designation.
                 designations = check_official_registration(batch, self._backend.read_officials())
+                if not designations.empty:
+                    designations = designations.copy()
+                    designations["designated_at"] = pd.Timestamp.now()
+                    # Designation BEFORE actual: a designation without its
+                    # actual is inert (the official join finds nothing and
+                    # latest is untouched), whereas an actual without its
+                    # designation would already move latest-basis accuracy.
+                    # A retry with the same recorded_at completes the pair.
+                    self._backend.append_officials_segment(designations)
             self._backend.append_actuals_segment(new_rows)
-            if designations is not None and not designations.empty:
-                designations = designations.copy()
-                designations["designated_at"] = pd.Timestamp.now()
-                self._backend.append_officials_segment(designations)
             logger.info(
                 "registered %d actual(s)%s", len(new_rows), " as official" if official else ""
             )
-            self._log_new_conflicts()
+            try:
+                self._log_new_conflicts()
+            except Exception:
+                # bookkeeping only: the registration is durable and resolution
+                # still excludes ambiguous targets; don't fail the write
+                logger.warning(
+                    "conflict bookkeeping failed after a durable registration", exc_info=True
+                )
         self._refresh_summary_after_write()
 
     def mark_official(
@@ -444,7 +513,7 @@ class ForecastArchive:
 
     def _raw_state(self) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         forecasts = self._backend.read_forecasts(
-            ForecastFilter(active_run_ids=self._manifest.active_run_ids())
+            ForecastFilter(active_run_ids=self._current_manifest().active_run_ids())
         )
         actuals = self._backend.read_actuals()
         officials = self._backend.read_officials()
@@ -458,15 +527,18 @@ class ForecastArchive:
 
     def _state_token(self) -> str:
         """Fingerprint of everything the summary is derived from: the active
-        run set, the stored actuals/officials, and the summarizable metric
-        set. A summary stamped with a different token is never served."""
+        run set, the stored actuals/officials, the summarizable metric set,
+        and the configured source priority (which steers same-timestamp
+        tiebreaks). A summary stamped with a different token is never served.
+        """
         digest = hashlib.sha256()
-        for run_id in sorted(self._manifest.active_run_ids()):
+        for run_id in sorted(self._current_manifest().active_run_ids()):
             digest.update(f"run:{run_id}\n".encode())
         for component in sorted(self._backend.raw_state_components()):
             digest.update(f"{component}\n".encode())
         for component in sorted(self._registry.token_components()):
             digest.update(f"{component}\n".encode())
+        digest.update(f"priority:{','.join(self._source_priority or [])}\n".encode())
         return digest.hexdigest()
 
     def _valid_summary(self) -> pd.DataFrame | None:

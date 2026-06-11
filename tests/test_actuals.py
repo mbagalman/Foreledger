@@ -223,3 +223,74 @@ def test_non_finite_actual_values_rejected(archive: ForecastArchive, bad_value: 
     setup_forecasts(archive)
     with pytest.raises(ValidationError):
         archive.register_actuals(one_target_frame(bad_value))
+
+
+def test_summary_not_served_across_source_priority_change(store: Path) -> None:
+    """The summary depends on the tiebreak configuration, so a handle opened
+    with a different source_priority must never serve a summary built under
+    the old one."""
+    from tests.conftest import forecast_value
+
+    first = ForecastArchive(store, source_priority=["a", "b"])
+    setup_forecasts(first)
+    ts = "2026-02-01T12:00:00"
+    first.register_actuals(one_target_frame(100.0), source="a", recorded_at=ts)
+    first.register_actuals(one_target_frame(120.0), source="b", recorded_at=ts)
+    predicted = forecast_value(1.0, "S1", ORIGINS[0], ORIGINS[0] + pd.Timedelta(days=1))
+    assert mae_at_h1(first).value == pytest.approx(abs(predicted - 100.0))  # "a" wins
+
+    reopened = ForecastArchive(store, source_priority=["b", "a"])
+    result = reopened.accuracy_at_horizon(1, model_id="alpha", model_version="v1", series="S1")
+    assert result.value == pytest.approx(abs(predicted - 120.0))  # "b" wins now
+    reopened.reconcile()
+
+
+def test_failed_actuals_append_after_designation_is_recoverable(
+    archive: ForecastArchive, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If the actual's append fails after its official designation landed,
+    nothing moves accuracy (the designation is inert without its actual), and
+    a retry with the same recorded_at completes the pair."""
+    setup_forecasts(archive)
+    ts = "2026-02-01T12:00:00"
+
+    def failing(frame: pd.DataFrame) -> None:
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr(archive._backend, "append_actuals_segment", failing)
+    with pytest.raises(OSError):
+        archive.register_actuals(
+            one_target_frame(100.0), source="rev1", official=True, recorded_at=ts
+        )
+    assert mae_at_h1(archive).status == "insufficient"
+    assert mae_at_h1(archive, basis="official").status == "insufficient"
+
+    monkeypatch.undo()
+    archive.register_actuals(one_target_frame(100.0), source="rev1", official=True, recorded_at=ts)
+    assert mae_at_h1(archive).status == "ok"
+    assert mae_at_h1(archive, basis="official").status == "ok"
+    archive.reconcile()
+
+
+def test_failed_designation_append_leaves_nothing_visible(
+    archive: ForecastArchive, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    setup_forecasts(archive)
+    ts = "2026-02-01T12:00:00"
+
+    def failing(frame: pd.DataFrame) -> None:
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr(archive._backend, "append_officials_segment", failing)
+    with pytest.raises(OSError):
+        archive.register_actuals(
+            one_target_frame(100.0), source="rev1", official=True, recorded_at=ts
+        )
+    # the designation write comes first, so the failed call left no trace
+    assert len(archive._backend.read_actuals()) == 0
+    assert mae_at_h1(archive).status == "insufficient"
+
+    monkeypatch.undo()
+    archive.register_actuals(one_target_frame(100.0), source="rev1", official=True, recorded_at=ts)
+    assert mae_at_h1(archive, basis="official").status == "ok"
+    archive.reconcile()

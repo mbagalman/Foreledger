@@ -126,3 +126,10 @@ def test_unrecognized_manifest_shape_is_a_typed_error(store: Path) -> None:
     (store / "runs.json").write_text('{"runs": [{"unknown_field": 1}]}', encoding="utf-8")
     with pytest.raises(StoreFormatError):
         ForecastArchive(store)
+
+
+def test_malformed_legacy_record_is_a_typed_error(store: Path) -> None:
+    ForecastArchive(store)
+    (store / "runs.json").write_text('{"runs": [{"series_key": "x"}]}', encoding="utf-8")
+    with pytest.raises(StoreFormatError, match="legacy"):
+        ForecastArchive(store)

@@ -179,6 +179,37 @@ def test_reregistered_metric_never_serves_the_old_implementation(
     populated.reconcile()
 
 
+def test_reregistered_closure_metric_never_serves_old_capture(
+    populated: ForecastArchive,
+) -> None:
+    """Review reproduction: identical code capturing different closure state
+    is invisible to any bytecode hash — every registration event must
+    invalidate the summary on its own."""
+
+    def make_constant_metric(constant: float):  # type: ignore[no-untyped-def]
+        def fn(forecast: FloatArray, actual: FloatArray) -> float:
+            return constant
+
+        return fn
+
+    populated.register_metric("Closure", make_constant_metric(1.0), summarizable=True)
+    assert (
+        populated.accuracy_at_horizon(
+            1, metric="Closure", model_id="alpha", model_version="v1"
+        ).value
+        == 1.0
+    )
+
+    populated.register_metric("Closure", make_constant_metric(2.0), summarizable=True)
+    assert (
+        populated.accuracy_at_horizon(
+            1, metric="Closure", model_id="alpha", model_version="v1"
+        ).value
+        == 2.0
+    )
+    populated.reconcile()
+
+
 def test_corrupt_summary_file_falls_back_to_raw(populated: ForecastArchive) -> None:
     expected = populated.accuracy_at_horizon(1, model_id="alpha", model_version="v1")
     (populated.store / "summary" / "summary.parquet").write_bytes(b"not parquet at all")

@@ -21,9 +21,9 @@ per series/period for the textbook reading.
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import threading
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -95,28 +95,17 @@ BUILTIN_SIMPLE: dict[str, MetricFn] = {"MAE": mae, "RMSE": rmse, "MAPE": mape}
 BUILTIN_NAMES = ("MAE", "RMSE", "MAPE", "MASE")
 
 
-def implementation_fingerprint(fn: MetricFn) -> str:
-    """A stable identity for a metric implementation.
-
-    Hashes the function's bytecode and constants so re-registering a *changed*
-    implementation under the same name invalidates the summary's state token,
-    while the same source re-registered (e.g. after a restart) keeps it valid.
-    Closure-captured values are not visible to this hash; a metric whose result
-    depends on enclosing state should be registered under a new name.
-    """
-    code = getattr(fn, "__code__", None)
-    if code is None:
-        return "opaque"
-    payload = code.co_code + repr(code.co_consts).encode() + repr(code.co_names).encode()
-    return hashlib.sha256(payload).hexdigest()[:16]
-
-
 @dataclass(frozen=True)
 class RegisteredMetric:
     name: str
     fn: MetricFn
     summarizable: bool
     builtin: bool
+    #: Unique per registration event for custom metrics. No static analysis
+    #: can reliably equate two arbitrary callables (closures, partials, bound
+    #: methods, defaults all carry hidden state), so every (re-)registration
+    #: gets a fresh identity and forces one summary rebuild — cheap, and it
+    #: can never serve a stale implementation's numbers.
     fingerprint: str = "builtin"
 
 
@@ -148,7 +137,7 @@ class MetricRegistry:
             fn,
             summarizable=summarizable,
             builtin=False,
-            fingerprint=implementation_fingerprint(fn),
+            fingerprint=uuid.uuid4().hex,
         )
         self._quarantined.discard(name)
         logger.info("registered metric (summarizable=%s)", summarizable)

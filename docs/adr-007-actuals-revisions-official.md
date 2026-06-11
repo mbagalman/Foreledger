@@ -8,6 +8,24 @@
 **Upstream artifacts:** tech-spec-forecast-archive-final.md
 **Originating question-id:** user-supplied (raised after the Final Tech Spec; refines the actuals layer from ADR-001/ADR-006 and partially pulls in the tri-temporality that v1 had deferred)
 
+> **Amended 2026-06-11 — result-status contract for missing actuals.**
+> Implementation surfaced an ambiguity in "targets … are reported
+> insufficient": read as a *whole-result* status, any scope containing recent
+> targets (whose actuals simply haven't arrived) would be insufficient,
+> making the status useless as a signal. The ratified contract is
+> three-state, applied identically under both bases and on both query routes:
+> `"ok"` — every forecast in scope was scored; `"partial"` — a value was
+> computed over the covered pairs and the uncovered targets are counted in
+> `n_missing_actuals` (this realizes the per-target "reported insufficient"
+> requirement: gaps are explicit and never silently substituted);
+> `"insufficient"` — nothing in scope could be scored. Under the strict
+> official basis, targets lacking an official actual count as missing (so the
+> status is at best `partial`) unless the caller opts into
+> `fallback="latest"`, whose fills are flagged per the original decision.
+> `AccuracyResult.ok` is true for `ok` and `partial`. The fail-loud posture is
+> unchanged: missing coverage can never read as complete or as perfect
+> accuracy.
+
 ## Assumptions and inferred inputs
 
 | Input | Source | If inferred or user-confirmed: notes |
