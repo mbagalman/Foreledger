@@ -1,0 +1,60 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+# NOTE: "forecast-archive" is a placeholder distribution name; the final PyPI
+# name must be chosen before the Phase 5 tag (see docs/implementation-plan).
+name = "forecast-archive"
+version = "0.1.0.dev0"
+description = "Production Forecast Archive — a durable, bitemporal archive of recurring forecast runs with horizon-keyed accuracy evaluation and cross-model/version comparison."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Michael Bagalman", email = "michael@paradoxresolution.com" }]
+keywords = ["forecasting", "forecast-evaluation", "time-series", "duckdb", "parquet"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+    "Typing :: Typed",
+]
+dependencies = [
+    "duckdb>=1.0,<2.0",
+    "pyarrow>=15.0",
+    "pandas>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "hypothesis>=6.100",
+    "ruff>=0.4",
+    "mypy>=1.10",
+    "build",
+]
+polars = ["polars>=1.0"]
+# snowflake extra arrives with the v1.1 warehouse backend (Phase 6)
+
+[project.urls]
+Repository = "https://github.com/mbagalman/Foreledger"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/forecast_archive"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+strict = true
+files = ["src"]
