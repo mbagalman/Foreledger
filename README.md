@@ -96,6 +96,12 @@ print(curve.to_frame())
   comparison reports challenger deltas automatically.
 - **Drill-down provenance** — any headline accuracy number can be exploded
   into the exact forecast/actual pairs behind it, and they reconcile exactly.
+- **Crash-safe and tamper-evident** — data becomes visible only when its
+  manifest commits, so a crash mid-write leaves the ledger at its prior
+  state; every committed file is fingerprinted (size/mtime/sha256), checked
+  cheaply on every query, and fully hash-audited by `reconcile()`. Files
+  deleted or modified outside the library fail loudly with a typed error —
+  never silently absent rows.
 - **Local-first, warehouse-ready** — v1 stores Parquet on your disk via
   DuckDB (your data never leaves your machine); the storage layer is built
   behind a dialect-aware seam so a Snowflake backend (v1.1) drops in without
@@ -110,6 +116,10 @@ Foreledger is a small, layered Python library (≥ 3.11):
   which is what makes ingestion all-or-nothing.
 - **Actuals log** — model-independent, append-only revisions keyed
   `(series, target, source, recorded_at)`, with sticky official designations.
+- **Integrity registry** — a fingerprint journal over every committed file,
+  doubling as the commit log: entries are staged before a write becomes
+  visible and confirmed after, so the store can always tell a failed write's
+  leftovers from externally tampered data.
 - **Accuracy summary** — a precomputed, *disposable* cache rebuilt eagerly on
   every write. Queries route to it invisibly and fall back to raw
   computation; both paths share one code path and a `reconcile()` check

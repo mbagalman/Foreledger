@@ -34,7 +34,7 @@ That's the whole setup. The directory is created if it doesn't exist and
 reopened if it does. Everything lives in plain Parquet/JSON files under that
 path — your data never leaves your machine.
 
-Two safety properties worth knowing from the start:
+Three safety properties worth knowing from the start:
 
 - Foreledger **never re-initializes** an existing non-archive directory; it
   raises `StoreFormatError` instead of touching your files.
@@ -46,6 +46,11 @@ Two safety properties worth knowing from the start:
   store migrates, older Foreledger versions refuse it with a clear error
   rather than misreading it, just as this version refuses stores written by
   a newer one.
+- **Concurrent pipelines are safe.** A cross-process lock serializes writes
+  and each commit lands atomically, so two jobs (or two archive handles)
+  writing to the same store merge their runs instead of clobbering each
+  other — and readers always see a committed state, never a half-written
+  one.
 
 ## 3. Ingest forecast runs
 
@@ -281,13 +286,22 @@ metric over them reproduces the summary value to the last bit.
 
 ```python
 print(archive.list_models())  # every (model, version) with coverage
-archive.reconcile()  # assert the precomputed summary == recomputation from raw
+archive.reconcile()  # deep audit: content hashes + summary == raw recomputation
 ```
 
-`reconcile()` should never fail — the summary is rebuilt eagerly on every
-write, validated against the raw state before it is ever served, and fully
-disposable (delete it and queries fall back to raw, invisibly). If it ever
-does fail, that's a bug worth reporting, not a tolerance to widen.
+Integrity checking is layered. Opening an archive and every query cheaply
+verify that each committed file is present with its recorded size and
+mtime — externally deleted or modified data raises `StoreFormatError`
+instead of reading as silently absent rows. `reconcile()` is the deep
+audit: it verifies the full sha256 content hash of every committed file,
+then asserts the precomputed summary exactly equals a fresh recomputation
+from raw.
+
+The summary half of `reconcile()` should never fail — the summary is
+rebuilt eagerly on every write, validated against the raw state before it
+is ever served, and fully disposable (delete it and queries fall back to
+raw, invisibly). If it ever does fail, that's a bug worth reporting, not a
+tolerance to widen.
 
 ## 7. Custom metrics
 
@@ -327,7 +341,9 @@ forecast_ledger/
 ├── actuals_manifest.json # actuals/officials visibility (transactional commit)
 ├── segment_integrity.json# size/mtime/sha256 per committed segment (tamper check)
 ├── champions.json        # champion per model_id
-└── error_log.txt         # unresolved actuals conflicts (created on demand)
+├── conflicts_logged.json # dedup marker for conflicts already in the error log
+├── error_log.txt         # unresolved actuals conflicts (created on demand)
+└── .foreledger.lock      # cross-process write lock (empty; safe to ignore)
 ```
 
 Plain files, open formats: anything that reads Parquet — DuckDB, pandas,
