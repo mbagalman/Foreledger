@@ -94,8 +94,10 @@ def test_concurrent_initialization_of_a_new_store(store: Path) -> None:
     with ThreadPoolExecutor(max_workers=8) as pool:
         handles = list(pool.map(construct, range(20)))
     assert len(handles) == 20
+    from foreledger import FORMAT_VERSION
+
     meta = json.loads((store / "archive_meta.json").read_text(encoding="utf-8"))
-    assert meta["format_version"] == 1
+    assert meta["format_version"] == FORMAT_VERSION
 
 
 def test_actuals_appends_from_two_handles_both_land(store: Path) -> None:

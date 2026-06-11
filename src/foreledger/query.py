@@ -75,6 +75,7 @@ class Evaluator:
         summary_provider: Callable[[], pd.DataFrame | None],
         actuals_provider: Callable[[], pd.DataFrame],
         officials_provider: Callable[[], pd.DataFrame],
+        integrity_check: Callable[[], None],
     ) -> None:
         self._backend = backend
         self._active_run_ids = active_run_ids
@@ -89,6 +90,9 @@ class Evaluator:
         # visibility was committed are ever read.
         self._actuals_provider = actuals_provider
         self._officials_provider = officials_provider
+        # Raises a typed error when committed raw segments are missing —
+        # externally deleted data must never read as silently absent rows.
+        self._integrity_check = integrity_check
 
     # -- shared plumbing ---------------------------------------------------
 
@@ -102,6 +106,7 @@ class Evaluator:
         period: Period = None,
         origin_max: pd.Timestamp | None = None,
     ) -> pd.DataFrame:
+        self._integrity_check()
         start, end = _parse_period(period)
         if origin_max is not None:
             end = origin_max if end is None else min(end, origin_max)

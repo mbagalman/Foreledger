@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
-from tests.conftest import actuals_frame, forecast_frame
+from tests.conftest import ORIGINS, actuals_frame, forecast_frame
 
 from foreledger import ForecastArchive, StoreFormatError, ValidationError
 
@@ -152,10 +152,18 @@ def test_unrecognized_manifest_shape_is_a_typed_error(store: Path) -> None:
         ForecastArchive(store)
 
 
-def test_pre_manifest_actuals_store_is_adopted(store: Path) -> None:
-    """Stores written before actuals visibility was manifest-committed adopt
-    their visible segments losslessly; dangling officials (the leftovers of
-    failed pre-manifest calls) stay inert."""
+def _downgrade_meta_to_v1(store: Path) -> None:
+    meta_path = store / "archive_meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["format_version"] = 1
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+
+def test_format1_actuals_store_is_migrated(store: Path) -> None:
+    """A format-1 store (directory-scan visibility) migrates on open: visible
+    segments adopt losslessly, dangling officials (the leftovers of failed
+    pre-manifest calls) stay inert, and the format version is bumped so
+    format-1 readers refuse the store instead of scanning uncommitted files."""
     archive = ForecastArchive(store)
     archive.ingest(forecast_frame(1.0), model_id="alpha", model_version="v1")
     archive.register_actuals(actuals_frame(), source="feed", recorded_at="2026-02-01")
@@ -164,9 +172,10 @@ def test_pre_manifest_actuals_store_is_adopted(store: Path) -> None:
     expected = archive.accuracy_at_horizon(1, model_id="alpha", model_version="v1")
     officials_before = len(archive._visible_officials())
 
-    # simulate a pre-manifest store: drop the manifest, add a dangling
-    # officials segment referencing an actual that was never registered
+    # simulate format 1: no visibility manifest, directory-scan semantics,
+    # plus a dangling officials segment from a failed pre-manifest call
     (store / "actuals_manifest.json").unlink()
+    _downgrade_meta_to_v1(store)
     dangling = pd.DataFrame(
         {
             "series_id": ["S1"],
@@ -183,7 +192,104 @@ def test_pre_manifest_actuals_store_is_adopted(store: Path) -> None:
     assert result.value == expected.value
     assert result.n == expected.n
     assert len(reopened._visible_officials()) == officials_before  # dangling excluded
+    meta = json.loads((store / "archive_meta.json").read_text(encoding="utf-8"))
+    assert meta["format_version"] == 2  # format-1 readers now refuse this store
     reopened.reconcile()
+
+
+def test_format2_store_missing_manifest_is_corrupt(store: Path) -> None:
+    """At format 2 the visibility manifest is mandatory: its absence is
+    corruption, never a license to adopt whatever segment files exist."""
+    archive = ForecastArchive(store)
+    archive.ingest(forecast_frame(1.0), model_id="alpha", model_version="v1")
+    archive.register_actuals(actuals_frame(), recorded_at="2026-02-01")
+    (store / "actuals_manifest.json").unlink()
+    with pytest.raises(StoreFormatError, match="manifest"):
+        ForecastArchive(store)
+
+
+def test_failed_first_registration_is_not_resurrected_on_reopen(
+    store: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review reproduction: the very first registration fails at the
+    visibility commit; reopening the store must not adopt the failed call's
+    segment files into visibility."""
+    archive = ForecastArchive(store)
+    archive.ingest(
+        forecast_frame(1.0, origins=ORIGINS[:1], series=["S1"], horizons=[1]),
+        model_id="alpha",
+        model_version="v1",
+    )
+    frame = pd.DataFrame(
+        {
+            "series_id": ["S1"],
+            "target": [ORIGINS[0] + pd.Timedelta(days=1)],
+            "value": [100.0],
+        }
+    )
+
+    def failing_save(self: object) -> None:
+        raise OSError("simulated crash at the visibility commit")
+
+    monkeypatch.setattr("foreledger.actuals.ActualsManifest.save", failing_save)
+    with pytest.raises(OSError):
+        archive.register_actuals(frame, source="rev1", official=True)
+    monkeypatch.undo()
+
+    reopened = ForecastArchive(store)
+    for basis in ("latest", "official"):
+        result = reopened.accuracy_at_horizon(1, basis=basis, model_id="alpha", model_version="v1")
+        assert result.status == "insufficient", basis
+
+    # and the same public call retries cleanly on the reopened handle
+    reopened.register_actuals(frame, source="rev1", official=True)
+    assert (
+        reopened.accuracy_at_horizon(
+            1, basis="official", model_id="alpha", model_version="v1"
+        ).status
+        == "ok"
+    )
+    reopened.reconcile()
+
+
+def test_missing_committed_segment_is_a_typed_error(store: Path) -> None:
+    """Review reproduction: deleting a committed raw segment must surface as
+    a typed error on every route — the disposable summary must never stay
+    authoritative over missing raw data."""
+    archive = ForecastArchive(store)
+    archive.ingest(forecast_frame(1.0), model_id="alpha", model_version="v1")
+    archive.register_actuals(actuals_frame(), recorded_at="2026-02-01")
+    assert archive.accuracy_at_horizon(1, model_id="alpha", model_version="v1").status == "ok"
+
+    manifest = json.loads((store / "actuals_manifest.json").read_text(encoding="utf-8"))
+    (store / manifest["actuals"][0]).unlink()
+
+    with pytest.raises(StoreFormatError, match="missing"):
+        archive.accuracy_at_horizon(1, model_id="alpha", model_version="v1")
+    with pytest.raises(StoreFormatError, match="missing"):
+        ForecastArchive(store).accuracy_at_horizon(1, model_id="alpha", model_version="v1")
+
+
+def test_tampered_manifest_cannot_read_outside_the_store(store: Path, tmp_path: Path) -> None:
+    """Review reproduction: manifest tokens are canonical relative paths; an
+    absolute path (or any malformed shape) is a typed corruption error, never
+    resolved against the filesystem."""
+    archive = ForecastArchive(store)
+    archive.ingest(forecast_frame(1.0), model_id="alpha", model_version="v1")
+    archive.register_actuals(actuals_frame(), recorded_at="2026-02-01")
+
+    outside = tmp_path / "outside.parquet"
+    archive._visible_actuals().to_parquet(outside, index=False)
+    manifest_path = store / "actuals_manifest.json"
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["actuals"] = [str(outside)]
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(StoreFormatError):
+        ForecastArchive(store)
+
+    manifest_path.write_text('{"actuals": "actuals", "officials": []}', encoding="utf-8")
+    with pytest.raises(StoreFormatError):
+        ForecastArchive(store)
 
 
 def test_malformed_legacy_record_is_a_typed_error(store: Path) -> None:

@@ -14,7 +14,13 @@ import pandas as pd
 
 from .errors import ValidationError
 
-FORMAT_VERSION = 1
+#: Archive on-disk format version. History:
+#: 1 — initial layout: directory-scan visibility for actuals/officials.
+#: 2 — actuals/officials visibility is committed through
+#:     ``actuals_manifest.json`` (transactional registration). Version-1
+#:     stores migrate automatically on open; version-1 readers refuse
+#:     version-2 stores rather than scanning uncommitted segment files.
+FORMAT_VERSION = 2
 
 DEFAULT_SOURCE = "default"
 ALL_SERIES = "*"

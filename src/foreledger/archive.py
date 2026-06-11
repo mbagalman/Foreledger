@@ -96,21 +96,25 @@ class ForecastArchive:
     ) -> None:
         self.store = Path(store)
         for label in source_priority or []:
+            if label is None:
+                raise ValidationError("source_priority entries must be non-empty strings, got None")
             validate_source_label(label)
         # cheap refusal before creating anything (incl. the lock file) inside
         # a directory that is not ours
         self._refuse_non_archive_dir()
         self.store.mkdir(parents=True, exist_ok=True)
+        self._actuals_manifest_path = self.store / "actuals_manifest.json"
         with self._lock():
             # serialized: concurrent constructors of a new store would race
             # on the shared metadata temp file otherwise
-            self._check_or_init_store()
+            needs_v1_migration = self._check_or_init_store()
         self._backend: Backend = create_backend(backend, self.store)
         self._manifest_path = self.store / "runs.json"
         self._manifest = self._load_manifest()
         self._manifest_key = self._manifest_file_key()
-        self._actuals_manifest_path = self.store / "actuals_manifest.json"
         with self._lock():
+            if needs_v1_migration:
+                self._migrate_v1_actuals_visibility()
             self._actuals_manifest = self._load_actuals_manifest()
         self._actuals_key = self._actuals_manifest_file_key()
         self._champions_path = self.store / "champions.json"
@@ -130,6 +134,7 @@ class ForecastArchive:
             summary_provider=self._valid_summary,
             actuals_provider=self._visible_actuals,
             officials_provider=self._visible_officials,
+            integrity_check=self._verify_committed_segments,
         )
 
     def _lock(self) -> StoreLock:
@@ -150,7 +155,10 @@ class ForecastArchive:
         names = {entry.name for entry in self.store.iterdir()}
         allowed = {".foreledger.lock"}
         if ".foreledger.lock" in names:
-            allowed.add("archive_meta.json.tmp")
+            # files a crashed/concurrent initializer may have left mid-init
+            allowed.update(
+                {"archive_meta.json.tmp", "actuals_manifest.json", "actuals_manifest.json.tmp"}
+            )
         return bool(names - allowed)
 
     def _refuse_non_archive_dir(self) -> None:
@@ -164,32 +172,55 @@ class ForecastArchive:
                 "to initialize over existing contents"
             )
 
-    def _check_or_init_store(self) -> None:
+    def _stored_format_version(self) -> int | None:
         meta_path = self.store / _META_FILE
-        self._refuse_non_archive_dir()
+        if not meta_path.exists():
+            return None
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            return int(meta["format_version"])
+        except (ValueError, KeyError, json.JSONDecodeError) as exc:
+            raise StoreFormatError(
+                f"archive metadata at {meta_path} is unreadable or corrupt"
+            ) from exc
+
+    def _write_format_version(self, version: int) -> None:
+        meta_path = self.store / _META_FILE
+        payload: dict[str, Any] = {"format_version": version}
         if meta_path.exists():
-            try:
-                meta = json.loads(meta_path.read_text(encoding="utf-8"))
-                stored_version = int(meta["format_version"])
-            except (ValueError, KeyError, json.JSONDecodeError) as exc:
-                raise StoreFormatError(
-                    f"archive metadata at {meta_path} is unreadable or corrupt"
-                ) from exc
+            payload = json.loads(meta_path.read_text(encoding="utf-8"))
+            payload["format_version"] = version
+        else:
+            payload["created_at"] = pd.Timestamp.now().isoformat()
+        tmp = meta_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, indent=1), encoding="utf-8")
+        os.replace(tmp, meta_path)
+
+    def _check_or_init_store(self) -> bool:
+        """Gate the format version; initialize a new store at the current one.
+
+        Returns True when the store is format 1 and needs the v1→v2 actuals
+        visibility migration (run later, once the backend exists).
+        """
+        self._refuse_non_archive_dir()
+        stored_version = self._stored_format_version()
+        if stored_version is not None:
             if stored_version > FORMAT_VERSION:
                 raise StoreFormatError(
                     f"archive format version {stored_version} is newer than this "
                     f"library supports ({FORMAT_VERSION}); upgrade foreledger "
                     "to open this store"
                 )
-            return
+            return stored_version < FORMAT_VERSION
         self.store.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "format_version": FORMAT_VERSION,
-            "created_at": pd.Timestamp.now().isoformat(),
-        }
-        tmp = meta_path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(payload, indent=1), encoding="utf-8")
-        os.replace(tmp, meta_path)
+        # Manifest before metadata: a crash in between leaves no metadata, so
+        # the next constructor simply finishes the initialization. A format-2
+        # store therefore always has its visibility manifest — an absence
+        # later is corruption, never a reason to adopt stray segment files.
+        if not self._actuals_manifest_path.exists():
+            ActualsManifest(path=self._actuals_manifest_path).save()
+        self._write_format_version(FORMAT_VERSION)
+        return False
 
     def _manifest_file_key(self) -> tuple[int, int] | None:
         """A cheap change marker (mtime_ns, size) for the manifest file."""
@@ -232,43 +263,55 @@ class ForecastArchive:
         return self._backend.read_officials(self._current_actuals_manifest().officials)
 
     def _load_actuals_manifest(self) -> ActualsManifest:
-        """Load the actuals visibility manifest, adopting pre-manifest stores.
+        """Load the actuals visibility manifest (mandatory at format 2)."""
+        if not self._actuals_manifest_path.exists():
+            raise StoreFormatError(
+                f"actuals visibility manifest is missing from {self.store}; the "
+                "archive is corrupt or was modified externally"
+            )
+        return ActualsManifest.load(self._actuals_manifest_path)
 
-        Stores written before visibility was manifest-committed have segment
-        files but no manifest: adopt every actuals segment (they were all
-        visible), and adopt an officials segment only if its designations
-        dereference registered actuals — a dangling officials file is the
-        leftover of a failed pre-manifest call and must stay inert.
+    def _migrate_v1_actuals_visibility(self) -> None:
+        """Migrate a format-1 store to manifest-committed actuals visibility.
+
+        Format 1 had directory-scan visibility: adopt every actuals segment
+        (they were all visible), and adopt an officials segment only if its
+        designations dereference registered actuals — a dangling officials
+        file is the leftover of a failed pre-manifest call and must stay
+        inert. The format version is bumped only after the manifest is
+        durable, so an interrupted migration simply reruns; once bumped,
+        format-1 readers refuse the store instead of scanning uncommitted
+        files.
         """
-        if self._actuals_manifest_path.exists():
-            return ActualsManifest.load(self._actuals_manifest_path)
-        actuals_segments, officials_segments = self._backend.list_segments()
-        if not actuals_segments and not officials_segments:
-            return ActualsManifest(path=self._actuals_manifest_path)
-
-        actuals = self._backend.read_actuals(actuals_segments)
-        identity = ["series_id", "target", "source", "actual_recorded_at"]
-        known = actuals[identity].drop_duplicates()
-        adopted_officials = []
-        for segment in officials_segments:
-            rows = self._backend.read_officials([segment])
-            live = rows.merge(known, on=identity, how="left", indicator=True)
-            if not rows.empty and (live["_merge"] == "both").all():
-                adopted_officials.append(segment)
-        manifest = ActualsManifest(
-            path=self._actuals_manifest_path,
-            actuals=actuals_segments,
-            officials=adopted_officials,
-        )
-        manifest.save()
-        logger.info(
-            "adopted pre-manifest actuals store: %d actuals segment(s), %d of %d "
-            "officials segment(s)",
-            len(actuals_segments),
-            len(adopted_officials),
-            len(officials_segments),
-        )
-        return manifest
+        # re-check under the lock: another handle may have migrated already
+        if self._stored_format_version() == FORMAT_VERSION:
+            return
+        if not self._actuals_manifest_path.exists():
+            actuals_segments, officials_segments = self._backend.list_segments()
+            actuals = self._backend.read_actuals(actuals_segments)
+            identity = ["series_id", "target", "source", "actual_recorded_at"]
+            known = actuals[identity].drop_duplicates()
+            adopted_officials = []
+            for segment in officials_segments:
+                rows = self._backend.read_officials([segment])
+                live = rows.merge(known, on=identity, how="left", indicator=True)
+                if not rows.empty and (live["_merge"] == "both").all():
+                    adopted_officials.append(segment)
+            manifest = ActualsManifest(
+                path=self._actuals_manifest_path,
+                actuals=actuals_segments,
+                officials=adopted_officials,
+            )
+            manifest.save()
+            logger.info(
+                "migrated format-1 actuals store: %d actuals segment(s), %d of %d "
+                "officials segment(s) adopted",
+                len(actuals_segments),
+                len(adopted_officials),
+                len(officials_segments),
+            )
+        self._write_format_version(FORMAT_VERSION)
+        logger.info("archive migrated to format version %d", FORMAT_VERSION)
 
     def _load_manifest(self) -> RunManifest:
         """Load the run manifest, migrating legacy (per series-set) records.
@@ -647,8 +690,31 @@ class ForecastArchive:
         digest.update(f"priority:{json.dumps(self._source_priority or [])}\n".encode())
         return digest.hexdigest()
 
+    def _verify_committed_segments(self) -> None:
+        """Assert every committed segment's data is still present.
+
+        Raw data is the source of truth; if a committed file was deleted or
+        moved externally, every read path must fail with a typed error — the
+        disposable summary must never become authoritative over missing raw.
+        """
+        manifest = self._current_manifest()
+        actuals_manifest = self._current_actuals_manifest()
+        committed = sorted(
+            {run.segment for run in manifest.runs if not run.superseded and run.segment}
+            | set(actuals_manifest.actuals)
+            | set(actuals_manifest.officials)
+        )
+        missing = self._backend.missing_segments(committed)
+        if missing:
+            raise StoreFormatError(
+                f"{len(missing)} committed segment(s) are missing from the store "
+                f"(e.g. {missing[0]!r}); raw archive data was deleted or modified "
+                "externally"
+            )
+
     def _valid_summary(self) -> pd.DataFrame | None:
         """The stored summary, only if it matches the current raw state."""
+        self._verify_committed_segments()
         stored = self._backend.read_summary()
         if stored is None:
             return None

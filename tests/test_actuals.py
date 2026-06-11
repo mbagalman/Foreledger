@@ -397,9 +397,10 @@ def test_non_string_source_rejected_and_store_stays_usable(
     assert mae_at_h1(archive).status == "ok"
 
 
-def test_non_string_source_priority_rejected(store: Path) -> None:
+@pytest.mark.parametrize("bad_entry", [123, None, "", "   "])
+def test_invalid_source_priority_entries_rejected(store: Path, bad_entry: object) -> None:
     with pytest.raises(ValidationError, match="source"):
-        ForecastArchive(store, source_priority=["feed", 123])  # type: ignore[list-item]
+        ForecastArchive(store, source_priority=["feed", bad_entry])  # type: ignore[list-item]
 
 
 def test_rejected_official_conflict_leaves_audit_files_untouched(

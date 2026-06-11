@@ -136,7 +136,13 @@ class Backend(ABC):
     @abstractmethod
     def list_segments(self) -> tuple[list[str], list[str]]:
         """All stored (actuals, officials) segment tokens — committed or not.
-        Used once at open to adopt pre-manifest stores."""
+        Used during the v1→v2 migration to adopt pre-manifest stores."""
+
+    @abstractmethod
+    def missing_segments(self, segments: Sequence[str]) -> list[str]:
+        """The subset of the given committed segment tokens whose data is no
+        longer present — externally deleted raw data must surface as a typed
+        error, never as silently absent rows or a stale summary."""
 
     @abstractmethod
     def read_summary(self) -> tuple[pd.DataFrame, str] | None:

@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -74,6 +75,38 @@ class ActualsManifest:
     actuals: list[str] = field(default_factory=list)
     officials: list[str] = field(default_factory=list)
 
+    #: A committed segment token is a canonical relative path: one known
+    #: directory, one flat filename, the expected suffix. Anything else —
+    #: absolute paths, traversal, nesting — is treated as store corruption,
+    #: never resolved: a tampered manifest must not be able to read files
+    #: outside the archive.
+    _TOKEN_PATTERNS = {
+        "actuals": re.compile(r"^actuals/[A-Za-z0-9._-]+\.parquet$"),
+        "officials": re.compile(r"^officials/[A-Za-z0-9._-]+\.parquet$"),
+    }
+
+    @classmethod
+    def _validated_tokens(cls, payload: Any, kind: str, path: Path) -> list[str]:
+        from .errors import StoreFormatError
+
+        tokens = payload.get(kind) if isinstance(payload, dict) else None
+        if not isinstance(tokens, list):
+            raise StoreFormatError(
+                f"actuals manifest at {path} is malformed: {kind!r} is not a list"
+            )
+        pattern = cls._TOKEN_PATTERNS[kind]
+        seen: set[str] = set()
+        for token in tokens:
+            if not isinstance(token, str) or not pattern.match(token):
+                raise StoreFormatError(
+                    f"actuals manifest at {path} holds an invalid {kind} segment "
+                    f"token {token!r}; the manifest is corrupt or was tampered with"
+                )
+            if token in seen:
+                raise StoreFormatError(f"actuals manifest at {path} lists segment {token!r} twice")
+            seen.add(token)
+        return list(tokens)
+
     @classmethod
     def load(cls, path: Path) -> ActualsManifest:
         from .errors import StoreFormatError
@@ -82,11 +115,13 @@ class ActualsManifest:
             return cls(path=path)
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
-            actuals = [str(name) for name in payload["actuals"]]
-            officials = [str(name) for name in payload["officials"]]
-        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        except json.JSONDecodeError as exc:
             raise StoreFormatError(f"actuals manifest at {path} is unreadable or corrupt") from exc
-        return cls(path=path, actuals=actuals, officials=officials)
+        return cls(
+            path=path,
+            actuals=cls._validated_tokens(payload, "actuals", path),
+            officials=cls._validated_tokens(payload, "officials", path),
+        )
 
     def save(self) -> None:
         payload = {"actuals": self.actuals, "officials": self.officials}

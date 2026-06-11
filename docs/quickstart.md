@@ -38,8 +38,10 @@ Two safety properties worth knowing from the start:
 
 - Foreledger **never re-initializes** an existing non-archive directory; it
   raises `StoreFormatError` instead of touching your files.
-- The archive carries a **format version**. A store written by a newer
-  Foreledger raises a clear error rather than being misread.
+- The archive carries a **format version** (currently 2; version-1 stores
+  migrate automatically on open). A store written by a newer Foreledger
+  raises a clear error rather than being misread — which also means an older
+  library refuses a newer store instead of silently misinterpreting it.
 
 ## 3. Ingest forecast runs
 

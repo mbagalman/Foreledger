@@ -20,6 +20,7 @@ from typing import Any
 import duckdb
 import pandas as pd
 
+from ..errors import StoreFormatError
 from ..schema import empty_actuals, empty_forecasts
 from .base import Backend, Dialect, ForecastFilter, build_forecast_predicate
 
@@ -131,8 +132,20 @@ class DuckDBBackend(Backend):
         frame["horizon"] = frame["horizon"].astype("int64")
         return frame
 
+    def missing_segments(self, segments: Sequence[str]) -> list[str]:
+        return [name for name in segments if not (self.store / name).exists()]
+
     def _segment_files(self, segments: Sequence[str]) -> list[str]:
-        return [(self.store / name).as_posix() for name in segments if (self.store / name).exists()]
+        # A committed segment that is gone is corruption, never a skip: the
+        # archive promises raw data is the durable source of truth.
+        missing = self.missing_segments(segments)
+        if missing:
+            raise StoreFormatError(
+                f"{len(missing)} committed segment(s) are missing from the store "
+                f"(e.g. {missing[0]!r}); raw archive data was deleted or modified "
+                "externally"
+            )
+        return [(self.store / name).as_posix() for name in segments]
 
     def read_actuals(self, segments: Sequence[str]) -> pd.DataFrame:
         files = self._segment_files(segments)
