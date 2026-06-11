@@ -20,6 +20,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import uuid
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, replace
@@ -56,12 +57,24 @@ class RunRecord:
         return (self.model_id, self.model_version, self.origin, self.series_id)
 
 
+_FORECAST_SEGMENT_PATTERN = re.compile(r"^forecasts/[A-Za-z0-9._-]+\.parquet$")
+
+
 def load_manifest_entries(path: Path) -> list[dict[str, Any]]:
-    """Raw manifest entries, with corruption surfaced as a typed error."""
+    """Raw manifest entries, with corruption surfaced as a typed error.
+
+    The run manifest is mandatory: a missing file is corruption, never an
+    empty archive — treating absence as emptiness would let a deleted
+    ``runs.json`` silently hide every committed forecast. New empty manifests
+    are constructed and saved directly at store initialization.
+    """
     from .errors import StoreFormatError
 
     if not path.exists():
-        return []
+        raise StoreFormatError(
+            f"run manifest is missing from {path.parent}; the archive is corrupt "
+            "or was modified externally"
+        )
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
         entries = payload.get("runs", [])
@@ -90,6 +103,14 @@ class RunManifest:
                 f"run manifest at {path} has an unrecognized record shape; it may "
                 "have been written by an incompatible foreledger version"
             ) from exc
+        for run in runs:
+            # canonical relative tokens only: a tampered manifest must not be
+            # able to point forecast reads at files outside the archive
+            if not _FORECAST_SEGMENT_PATTERN.match(run.segment):
+                raise StoreFormatError(
+                    f"run manifest at {path} holds an invalid segment token "
+                    f"{run.segment!r}; the manifest is corrupt or was tampered with"
+                )
         return cls(path=path, runs=runs)
 
     @classmethod

@@ -17,10 +17,14 @@ from .errors import ValidationError
 #: Archive on-disk format version. History:
 #: 1 — initial layout: directory-scan visibility for actuals/officials.
 #: 2 — actuals/officials visibility is committed through
-#:     ``actuals_manifest.json`` (transactional registration). Version-1
-#:     stores migrate automatically on open; version-1 readers refuse
-#:     version-2 stores rather than scanning uncommitted segment files.
-FORMAT_VERSION = 2
+#:     ``actuals_manifest.json`` (transactional registration).
+#: 3 — ``runs.json`` and ``segment_integrity.json`` are mandatory: forecast
+#:     reads scan only manifest-committed segments, every referenced segment
+#:     (including superseded history) carries a recorded fingerprint, and a
+#:     missing metadata file is corruption rather than emptiness.
+#: Older stores migrate automatically on open (1→2→3); older readers refuse
+#: newer stores rather than misreading them.
+FORMAT_VERSION = 3
 
 DEFAULT_SOURCE = "default"
 ALL_SERIES = "*"

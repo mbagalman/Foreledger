@@ -454,15 +454,9 @@ def test_post_commit_audit_failure_is_typed_and_self_heals(
 
     # the data is durable and visible (the target is now ambiguous)
     assert mae_at_h1(archive).status == "insufficient"
-    # ... and the next successful registration writes the missed entry
-    other_target = pd.DataFrame(
-        {
-            "series_id": ["S1"],
-            "target": [ORIGINS[0] + pd.Timedelta(days=2)],
-            "value": [50.0],
-        }
-    )
-    archive.register_actuals(other_target, source="a", recorded_at="2026-02-02")
+    # the NATURAL retry — the identical registration — drains the pending
+    # audit entry even though it is an exact-replay no-op for the data
+    archive.register_actuals(one_target_frame(110.0), source="b", recorded_at=ts)
     assert "ambiguous-latest" in (store / "error_log.txt").read_text(encoding="utf-8")
 
 

@@ -121,7 +121,8 @@ class DuckDBBackend(Backend):
     # -- reads ---------------------------------------------------------------
 
     def read_forecasts(self, flt: ForecastFilter) -> pd.DataFrame:
-        files = self._files(self.forecasts_dir)
+        # scan only manifest-committed segments — never the directory
+        files = self._segment_files(flt.segments)
         if not files or not list(flt.active_run_ids):
             return empty_forecasts()
         predicate, params = build_forecast_predicate(self.dialect, flt)

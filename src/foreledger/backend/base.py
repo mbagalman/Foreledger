@@ -30,9 +30,15 @@ class Dialect:
 
 @dataclass(frozen=True)
 class ForecastFilter:
-    """Engine-neutral filter over the canonical forecast columns."""
+    """Engine-neutral filter over the canonical forecast columns.
+
+    ``segments`` lists the committed segment tokens to scan — the manifest is
+    the single visibility point, so an unmanifested file is never read even
+    if it carries an active run_id.
+    """
 
     active_run_ids: Sequence[str]
+    segments: Sequence[str] = ()
     model_id: str | None = None
     model_version: str | None = None
     models: Sequence[tuple[str, str]] | None = None

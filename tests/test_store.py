@@ -192,8 +192,10 @@ def test_format1_actuals_store_is_migrated(store: Path) -> None:
     assert result.value == expected.value
     assert result.n == expected.n
     assert len(reopened._visible_officials()) == officials_before  # dangling excluded
+    from foreledger import FORMAT_VERSION
+
     meta = json.loads((store / "archive_meta.json").read_text(encoding="utf-8"))
-    assert meta["format_version"] == 2  # format-1 readers now refuse this store
+    assert meta["format_version"] == FORMAT_VERSION  # format-1 readers refuse this store
     reopened.reconcile()
 
 
@@ -290,6 +292,104 @@ def test_tampered_manifest_cannot_read_outside_the_store(store: Path, tmp_path: 
     manifest_path.write_text('{"actuals": "actuals", "officials": []}', encoding="utf-8")
     with pytest.raises(StoreFormatError):
         ForecastArchive(store)
+
+
+def _populated(store: Path) -> ForecastArchive:
+    archive = ForecastArchive(store)
+    archive.ingest(forecast_frame(1.0), model_id="alpha", model_version="v1")
+    archive.register_actuals(actuals_frame(), recorded_at="2026-02-01")
+    return archive
+
+
+def test_deleting_runs_manifest_is_a_typed_error(store: Path) -> None:
+    """Review reproduction: a deleted runs.json must be corruption on the
+    live handle and on reopen — never a silently empty forecast archive —
+    and must not cause integrity records to be pruned."""
+    archive = _populated(store)
+    assert archive.accuracy_at_horizon(1, model_id="alpha", model_version="v1").status == "ok"
+    integrity_before = (store / "segment_integrity.json").read_text(encoding="utf-8")
+
+    (store / "runs.json").unlink()
+    with pytest.raises(StoreFormatError, match="run manifest"):
+        archive.accuracy_at_horizon(1, model_id="alpha", model_version="v1")
+    with pytest.raises(StoreFormatError, match="run manifest"):
+        ForecastArchive(store)
+    # the failed opens never rewrote the integrity registry
+    assert (store / "segment_integrity.json").read_text(encoding="utf-8") == integrity_before
+
+
+def test_unmanifested_forecast_file_is_invisible(store: Path) -> None:
+    """Review reproduction: a stray Parquet file carrying an active run_id
+    must not be readable — the run manifest is the single visibility point."""
+    archive = _populated(store)
+    baseline = archive.accuracy_at_horizon(1, model_id="alpha", model_version="v1")
+    rows_before = len(archive.as_of("2100-01-01"))
+
+    runs = json.loads((store / "runs.json").read_text(encoding="utf-8"))
+    committed = store / runs["runs"][0]["segment"]
+    (store / "forecasts" / "stray.parquet").write_bytes(committed.read_bytes())
+
+    assert len(archive.as_of("2100-01-01")) == rows_before
+    raw_view = ForecastArchive(store)
+    (raw_view.store / "summary" / "summary.parquet").unlink()
+    raw = raw_view.accuracy_at_horizon(1, model_id="alpha", model_version="v1")
+    assert raw.served_from == "raw"
+    assert raw.n == baseline.n  # the stray file inflated nothing
+
+
+def test_superseded_segment_deletion_is_detected(store: Path) -> None:
+    """Review reproduction: superseded history is still part of the
+    append-only record — deleting its segment file must fail loudly, on
+    queries and on reconcile, even after a reopen."""
+    archive = ForecastArchive(store)
+    frame = forecast_frame(1.0)
+    archive.ingest(frame, model_id="alpha", model_version="v1")
+    old_segment = json.loads((store / "runs.json").read_text(encoding="utf-8"))["runs"][0][
+        "segment"
+    ]
+    changed = frame.copy()
+    changed["value"] = changed["value"] + 1.0
+    archive.ingest(changed, model_id="alpha", model_version="v1", on_conflict="overwrite")
+    archive.register_actuals(actuals_frame(), recorded_at="2026-02-01")
+
+    reopened = ForecastArchive(store)  # reopen must not prune the old fingerprint
+    (store / old_segment).unlink()
+    with pytest.raises(StoreFormatError, match="missing"):
+        reopened.accuracy_at_horizon(1, model_id="alpha", model_version="v1")
+    with pytest.raises(StoreFormatError, match="missing"):
+        reopened.reconcile()
+
+
+def test_v2_store_migrates_and_rebless_invalidates_summary(store: Path) -> None:
+    """Review reproduction (recovery path): adopting changed content must
+    invalidate the old summary — the re-blessed bytes change the recorded
+    fingerprints, which are bound into the summary token."""
+    archive = _populated(store)
+    stale = archive.accuracy_at_horizon(1, model_id="alpha", model_version="v1")
+    assert stale.served_from == "summary"
+
+    # tamper a committed actuals segment, then simulate a v2 store (no
+    # integrity registry) so reopen runs the adopting migration
+    manifest = json.loads((store / "actuals_manifest.json").read_text(encoding="utf-8"))
+    token = manifest["actuals"][0]
+    tampered = pd.read_parquet(store / token)
+    tampered["actual_value"] = tampered["actual_value"] + 100.0
+    tampered.to_parquet(store / token, index=False)
+    (store / "segment_integrity.json").unlink()
+    meta_path = store / "archive_meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["format_version"] = 2
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+    reopened = ForecastArchive(store)
+    result = reopened.accuracy_at_horizon(1, model_id="alpha", model_version="v1")
+    # never the stale pre-tamper summary: the value reflects current raw
+    assert result.value != stale.value
+    reopened.reconcile()
+    from foreledger import FORMAT_VERSION
+
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    assert meta["format_version"] == FORMAT_VERSION
 
 
 def test_deleting_manifest_on_a_live_handle_is_a_typed_error(store: Path) -> None:

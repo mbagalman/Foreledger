@@ -41,9 +41,11 @@ signed off on — and Foreledger answers, instantly and reproducibly:
    over a common scope, with deltas against your designated champion. Every
    row reports its own sample count and coverage, and each value provably
    equals the corresponding single-model query — no hidden re-weighting.
-3. **What did we know when** — replay the forecast exactly as it stood on any
-   past date, with no hindsight leaking in. The forecast that drove the March
-   decision is one query away.
+3. **Origin-scoped snapshots** — query the current record filtered to runs
+   dated on or before any past day, with no later-dated runs leaking in. One
+   honest caveat: an explicit overwrite revises this view (supersessions are
+   recorded), so it reflects the archive's current state of those runs, not a
+   transaction-time replay.
 
 When the data can't fully support an answer, Foreledger says so out loud: a
 scope with gaps is flagged *partial* with the missing count attached, and one

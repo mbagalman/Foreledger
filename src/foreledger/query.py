@@ -69,6 +69,7 @@ class Evaluator:
         self,
         backend: Backend,
         active_run_ids: Callable[[], list[str]],
+        forecast_segments: Callable[[], list[str]],
         registry: MetricRegistry,
         source_priority: list[str] | None,
         champions: Callable[[], dict[str, str]],
@@ -79,6 +80,9 @@ class Evaluator:
     ) -> None:
         self._backend = backend
         self._active_run_ids = active_run_ids
+        # the manifest is the single visibility point: forecast scans cover
+        # exactly the committed active segments, never the directory
+        self._forecast_segments = forecast_segments
         self._registry = registry
         self._source_priority = source_priority
         self._champions = champions
@@ -112,6 +116,7 @@ class Evaluator:
             end = origin_max if end is None else min(end, origin_max)
         flt = ForecastFilter(
             active_run_ids=self._active_run_ids(),
+            segments=self._forecast_segments(),
             model_id=model_id,
             model_version=model_version,
             series=_series_list(series),
@@ -427,8 +432,11 @@ class Evaluator:
         model_version: str | None = None,
         series: str | Sequence[str] | None = None,
     ) -> pd.DataFrame:
-        """Forecasts known as of ``origin`` — rows with ``origin <= origin``;
-        no leakage from later runs by construction."""
+        """The current record of runs with origin on or before the cutoff.
+
+        Origin-time filter (tech spec FR-4.1): later-origin rows never appear.
+        Not a transaction-time replay — explicit overwrites revise this view
+        for past origins."""
         cutoff = to_timestamp(origin, "origin")
         forecasts = self._read_forecasts(
             model_id=model_id, model_version=model_version, series=series, origin_max=cutoff

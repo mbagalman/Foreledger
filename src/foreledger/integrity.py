@@ -1,15 +1,24 @@
 """Committed-segment integrity registry.
 
-Every committed segment (forecast, actuals, officials) gets a fingerprint —
-size, mtime_ns, and a sha256 content hash — recorded at commit time, before
-the segment becomes visible. Reads verify size+mtime cheaply on every query;
-``reconcile()`` verifies the full content hash. Raw data modified or replaced
-outside the library therefore fails loudly with a typed error instead of
-letting the disposable summary stay authoritative over changed raw.
+Every referenced segment (forecast — active or superseded history — actuals,
+officials) gets a fingerprint — size, mtime_ns, and a sha256 content hash —
+recorded at commit time, before the segment becomes visible. Reads verify
+size+mtime cheaply on every query; ``reconcile()`` verifies the full content
+hash; the recorded hashes are bound into the summary's state token. Raw data
+modified or replaced outside the library therefore fails loudly with a typed
+error instead of letting the disposable summary stay authoritative over
+changed raw.
 
-Deleting ``segment_integrity.json`` and reopening re-fingerprints the current
-content as authoritative — the explicit recovery path after intentional
-external surgery.
+Boundary: the per-query probe is stat-based, so an adversary who restores a
+file's exact size and mtime can evade it until the next ``reconcile()``
+hash audit. External modification of committed segments is unsupported; the
+registry exists to make it loud, not to make it safe.
+
+The registry is mandatory at format 3 — its absence is corruption.
+Fingerprints adopt only during the format migration; recovering after
+intentional external surgery means updating the registry entries by hand
+(and deleting the summary so it rebuilds), deliberately not a casual
+operation.
 """
 
 from __future__ import annotations
@@ -35,9 +44,10 @@ class SegmentIntegrity:
         from .errors import StoreFormatError
 
         if not path.exists():
-            # absent registry = adopt-current-content at open (upgrade path
-            # from stores written before integrity tracking existed)
-            return cls(path=path)
+            raise StoreFormatError(
+                f"segment integrity registry is missing from {path.parent}; the "
+                "archive is corrupt or was modified externally"
+            )
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
             entries = payload["segments"]

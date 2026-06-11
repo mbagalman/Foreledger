@@ -111,21 +111,27 @@ class ForecastArchive:
         self._refuse_non_archive_dir()
         self.store.mkdir(parents=True, exist_ok=True)
         self._actuals_manifest_path = self.store / "actuals_manifest.json"
+        self._manifest_path = self.store / "runs.json"
+        self._integrity_path = self.store / "segment_integrity.json"
         with self._lock():
             # serialized: concurrent constructors of a new store would race
             # on the shared metadata temp file otherwise
-            needs_v1_migration = self._check_or_init_store()
+            stored_version = self._check_or_init_store()
         self._backend: Backend = create_backend(backend, self.store)
-        self._manifest_path = self.store / "runs.json"
-        self._manifest = self._load_manifest()
-        self._manifest_key = self._manifest_file_key()
-        self._integrity_path = self.store / "segment_integrity.json"
         with self._lock():
-            if needs_v1_migration:
+            if stored_version == 1:
                 self._migrate_v1_actuals_visibility()
+            if stored_version < FORMAT_VERSION and not self._manifest_path.exists():
+                # pre-v3 stores wrote runs.json lazily on first ingest
+                RunManifest(path=self._manifest_path).save()
+            self._manifest = self._load_manifest()
+            self._manifest_key = self._manifest_file_key()
             self._actuals_manifest = self._load_actuals_manifest()
             self._actuals_key = self._actuals_manifest_file_key()
-            self._ensure_integrity_records()
+            if stored_version < FORMAT_VERSION:
+                self._migrate_to_v3()
+            else:
+                self._prune_integrity_records()
         self._champions_path = self.store / "champions.json"
         self._conflicts_logged_path = self.store / "conflicts_logged.json"
         self._error_log = (
@@ -137,6 +143,7 @@ class ForecastArchive:
             backend=self._backend,
             # late-bound and freshness-checked: reads see other handles' commits
             active_run_ids=lambda: self._current_manifest().active_run_ids(),
+            forecast_segments=self._active_forecast_segments,
             registry=self._registry,
             source_priority=self._source_priority,
             champions=self.champions,
@@ -166,7 +173,15 @@ class ForecastArchive:
         if ".foreledger.lock" in names:
             # files a crashed/concurrent initializer may have left mid-init
             allowed.update(
-                {"archive_meta.json.tmp", "actuals_manifest.json", "actuals_manifest.json.tmp"}
+                {
+                    "archive_meta.json.tmp",
+                    "actuals_manifest.json",
+                    "actuals_manifest.json.tmp",
+                    "runs.json",
+                    "runs.json.tmp",
+                    "segment_integrity.json",
+                    "segment_integrity.json.tmp",
+                }
             )
         return bool(names - allowed)
 
@@ -212,40 +227,45 @@ class ForecastArchive:
         tmp.write_text(json.dumps(payload, indent=1), encoding="utf-8")
         os.replace(tmp, meta_path)
 
-    def _check_or_init_store(self) -> bool:
+    def _check_or_init_store(self) -> int:
         """Gate the format version; initialize a new store at the current one.
 
-        Returns True when the store is format 1 and needs the v1→v2 actuals
-        visibility migration (run later, once the backend exists).
+        Returns the stored format version (``FORMAT_VERSION`` for a freshly
+        initialized store); versions below it are migrated later, once the
+        backend exists.
         """
         self._refuse_non_archive_dir()
         stored_version = self._stored_format_version()
         if stored_version is not None:
             if stored_version == FORMAT_VERSION:
-                return False
+                return stored_version
             if stored_version > FORMAT_VERSION:
                 raise StoreFormatError(
                     f"archive format version {stored_version} is newer than this "
                     f"library supports ({FORMAT_VERSION}); upgrade foreledger "
                     "to open this store"
                 )
-            if stored_version == 1:
-                return True
-            # only version 1 has a defined migration; anything else older is
-            # an unknown layout we must not reinterpret or rewrite
+            if stored_version in (1, 2):
+                return stored_version
+            # only versions 1 and 2 have defined migrations; anything else
+            # older is an unknown layout we must not reinterpret or rewrite
             raise StoreFormatError(
                 f"archive format version {stored_version} is not supported; "
                 "no migration is defined for it"
             )
         self.store.mkdir(parents=True, exist_ok=True)
-        # Manifest before metadata: a crash in between leaves no metadata, so
-        # the next constructor simply finishes the initialization. A format-2
-        # store therefore always has its visibility manifest — an absence
-        # later is corruption, never a reason to adopt stray segment files.
+        # Mandatory metadata before the version marker: a crash in between
+        # leaves no metadata file, so the next constructor simply finishes
+        # the initialization. A healthy format-3 store therefore always has
+        # all three — an absence later is corruption, never emptiness.
         if not self._actuals_manifest_path.exists():
             ActualsManifest(path=self._actuals_manifest_path).save()
+        if not self._manifest_path.exists():
+            RunManifest(path=self._manifest_path).save()
+        if not self._integrity_path.exists():
+            SegmentIntegrity(path=self._integrity_path).save()
         self._write_format_version(FORMAT_VERSION)
-        return False
+        return FORMAT_VERSION
 
     def _manifest_file_key(self) -> tuple[int, int] | None:
         """A cheap change marker (mtime_ns, size) for the manifest file."""
@@ -294,60 +314,83 @@ class ForecastArchive:
         return ActualsManifest.load(self._actuals_manifest_path)
 
     def _migrate_v1_actuals_visibility(self) -> None:
-        """Migrate a format-1 store to manifest-committed actuals visibility.
+        """Format-1 → 2 step: adopt manifest-committed actuals visibility.
 
         Format 1 had directory-scan visibility: adopt every actuals segment
         (they were all visible), and adopt an officials segment only if its
         designations dereference registered actuals — a dangling officials
         file is the leftover of a failed pre-manifest call and must stay
-        inert. The format version is bumped only after the manifest is
-        durable, so an interrupted migration simply reruns; once bumped,
-        format-1 readers refuse the store instead of scanning uncommitted
-        files.
+        inert. Caller holds the store lock; the version bump happens at the
+        end of the full migration chain.
         """
-        # re-check under the lock: another handle may have migrated already
-        if self._stored_format_version() == FORMAT_VERSION:
+        if self._actuals_manifest_path.exists():
             return
-        if not self._actuals_manifest_path.exists():
-            actuals_segments, officials_segments = self._backend.list_segments()
-            actuals = self._backend.read_actuals(actuals_segments)
-            identity = ["series_id", "target", "source", "actual_recorded_at"]
-            known = actuals[identity].drop_duplicates()
-            adopted_officials = []
-            for segment in officials_segments:
-                rows = self._backend.read_officials([segment])
-                live = rows.merge(known, on=identity, how="left", indicator=True)
-                if not rows.empty and (live["_merge"] == "both").all():
-                    adopted_officials.append(segment)
-            manifest = ActualsManifest(
-                path=self._actuals_manifest_path,
-                actuals=actuals_segments,
-                officials=adopted_officials,
-            )
-            manifest.save()
-            logger.info(
-                "migrated format-1 actuals store: %d actuals segment(s), %d of %d "
-                "officials segment(s) adopted",
-                len(actuals_segments),
-                len(adopted_officials),
-                len(officials_segments),
-            )
+        actuals_segments, officials_segments = self._backend.list_segments()
+        actuals = self._backend.read_actuals(actuals_segments)
+        identity = ["series_id", "target", "source", "actual_recorded_at"]
+        known = actuals[identity].drop_duplicates()
+        adopted_officials = []
+        for segment in officials_segments:
+            rows = self._backend.read_officials([segment])
+            live = rows.merge(known, on=identity, how="left", indicator=True)
+            if not rows.empty and (live["_merge"] == "both").all():
+                adopted_officials.append(segment)
+        manifest = ActualsManifest(
+            path=self._actuals_manifest_path,
+            actuals=actuals_segments,
+            officials=adopted_officials,
+        )
+        manifest.save()
+        logger.info(
+            "migrated format-1 actuals store: %d actuals segment(s), %d of %d "
+            "officials segment(s) adopted",
+            len(actuals_segments),
+            len(adopted_officials),
+            len(officials_segments),
+        )
+
+    def _migrate_to_v3(self) -> None:
+        """Final migration step: adopt integrity fingerprints and bump.
+
+        Every referenced segment — including superseded history, which the
+        append-only promise still protects — gets a fingerprint of its
+        current content. Adoption is migration-only: once at format 3, a
+        missing registry or fingerprint is corruption, never an implicit
+        authorization to trust whatever bytes are present. The version is
+        bumped last so an interrupted migration simply reruns. Caller holds
+        the store lock.
+        """
+        registry = (
+            SegmentIntegrity.load(self._integrity_path)
+            if self._integrity_path.exists()
+            else SegmentIntegrity(path=self._integrity_path)
+        )
+        tokens = self._referenced_tokens()
+        adopted = 0
+        for token in tokens:
+            if token not in registry.entries:
+                registry.entries[token] = self._backend.fingerprint_segment(token)
+                adopted += 1
+        for stale in set(registry.entries) - set(tokens):
+            del registry.entries[stale]
+        registry.save()
         self._write_format_version(FORMAT_VERSION)
-        logger.info("archive migrated to format version %d", FORMAT_VERSION)
+        logger.info(
+            "archive migrated to format version %d (%d fingerprint(s) adopted)",
+            FORMAT_VERSION,
+            adopted,
+        )
 
     def _load_manifest(self) -> RunManifest:
         """Load the run manifest, migrating legacy (per series-set) records.
 
         Corruption or an unrecognized shape raises :class:`StoreFormatError`;
-        the archive never guesses at run visibility.
+        the archive never guesses at run visibility. Caller holds the store
+        lock.
         """
         entries = load_manifest_entries(self._manifest_path)
         if any("series_key" in entry for entry in entries):
-            with self._lock():
-                # re-read under the lock: another handle may have migrated
-                entries = load_manifest_entries(self._manifest_path)
-                if any("series_key" in entry for entry in entries):
-                    return self._migrate_legacy_manifest(entries)
+            return self._migrate_legacy_manifest(entries)
         return RunManifest.from_entries(self._manifest_path, entries)
 
     def _migrate_legacy_manifest(self, entries: list[dict[str, Any]]) -> RunManifest:
@@ -377,7 +420,10 @@ class ForecastArchive:
             if entry.get("superseded"):
                 continue  # invisible before the migration, invisible after
             rows = self._backend.read_forecasts(
-                ForecastFilter(active_run_ids=[str(entry["run_id"])])
+                ForecastFilter(
+                    active_run_ids=[str(entry["run_id"])],
+                    segments=[str(entry["segment"])],
+                )
             )
             for series_id, group in rows.groupby("series_id", sort=True):
                 run_id = uuid.uuid4().hex
@@ -402,6 +448,7 @@ class ForecastArchive:
             )
             for record in migrated:
                 record.segment = segment
+            self._record_segment_integrity([segment])
 
         manifest = RunManifest(path=self._manifest_path, runs=[*records, *migrated])
         manifest.save()
@@ -579,6 +626,18 @@ class ForecastArchive:
                     designations = designations.copy()
                     designations["designated_at"] = pd.Timestamp.now()
             if new_rows.empty and designations is None:
+                # An exact replay is also the natural retry after a
+                # ConflictLogError: drain any audit entries whose data
+                # committed but whose write previously failed.
+                replay_pending = self._pending_conflicts(existing)
+                if replay_pending:
+                    try:
+                        self._write_conflict_records(replay_pending)
+                    except Exception as exc:
+                        raise ConflictLogError(
+                            "the registration is already committed, but its pending "
+                            "conflict audit records still cannot be written"
+                        ) from exc
                 logger.info("registration was a no-op (exact replay)")
                 self._refresh_summary_after_write()
                 return
@@ -700,7 +759,10 @@ class ForecastArchive:
 
     def _raw_state(self) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         forecasts = self._backend.read_forecasts(
-            ForecastFilter(active_run_ids=self._current_manifest().active_run_ids())
+            ForecastFilter(
+                active_run_ids=self._current_manifest().active_run_ids(),
+                segments=self._active_forecast_segments(),
+            )
         )
         return forecasts, self._visible_actuals(), self._visible_officials()
 
@@ -729,37 +791,47 @@ class ForecastArchive:
         # JSON, not a join: source labels are opaque user strings and may
         # contain any delimiter, so only a structured encoding is collision-free
         digest.update(f"priority:{json.dumps(self._source_priority or [])}\n".encode())
+        # Recorded content fingerprints: re-blessing content (migration
+        # adoption, manual registry repair) changes the recorded hashes and
+        # therefore invalidates any summary built over the old bytes.
+        registry = SegmentIntegrity.load(self._integrity_path)
+        for token in sorted(registry.entries):
+            digest.update(f"integrity:{token}:{registry.entries[token]['sha256']}\n".encode())
         return digest.hexdigest()
 
-    def _committed_tokens(self) -> list[str]:
+    def _active_forecast_segments(self) -> list[str]:
+        """Segment tokens scanned by forecast reads: non-superseded runs only."""
+        return sorted(
+            {
+                run.segment
+                for run in self._current_manifest().runs
+                if not run.superseded and run.segment
+            }
+        )
+
+    def _referenced_tokens(self) -> list[str]:
+        """Every segment referenced by any record — including superseded
+        history. The archive is append-only: superseded runs leave the active
+        view but their data is still part of the record, so integrity
+        coverage never drops them."""
         manifest = self._current_manifest()
         actuals_manifest = self._current_actuals_manifest()
         return sorted(
-            {run.segment for run in manifest.runs if not run.superseded and run.segment}
+            {run.segment for run in manifest.runs if run.segment}
             | set(actuals_manifest.actuals)
             | set(actuals_manifest.officials)
         )
 
-    def _ensure_integrity_records(self) -> None:
-        """Adopt fingerprints for committed segments that lack one and prune
-        records for segments no longer committed.
-
-        Runs once at open (under the store lock): the upgrade path for stores
-        written before integrity tracking, and the explicit recovery path —
-        deleting the registry re-fingerprints current content as
-        authoritative.
-        """
+    def _prune_integrity_records(self) -> None:
+        """Drop fingerprints for segments referenced by nothing (the invisible
+        leftovers of failed commits). Prune-only: at format 3 a referenced
+        segment without a fingerprint is corruption, never something to
+        silently adopt. Caller holds the store lock."""
         registry = SegmentIntegrity.load(self._integrity_path)
-        tokens = self._committed_tokens()
-        changed = False
-        for token in tokens:
-            if token not in registry.entries:
-                registry.entries[token] = self._backend.fingerprint_segment(token)
-                changed = True
-        for stale in set(registry.entries) - set(tokens):
-            del registry.entries[stale]
-            changed = True
-        if changed:
+        stale = set(registry.entries) - set(self._referenced_tokens())
+        if stale:
+            for token in stale:
+                del registry.entries[token]
             registry.save()
 
     def _record_segment_integrity(self, tokens: Sequence[str]) -> None:
@@ -768,23 +840,29 @@ class ForecastArchive:
         committed segment always has its fingerprint on record."""
         if not tokens:
             return
-        registry = SegmentIntegrity.load(self._integrity_path)
+        registry = (
+            SegmentIntegrity.load(self._integrity_path)
+            if self._integrity_path.exists()
+            else SegmentIntegrity(path=self._integrity_path)  # mid-migration only
+        )
         for token in tokens:
             registry.entries[token] = self._backend.fingerprint_segment(token)
         registry.save()
 
     def _verify_committed_segments(self) -> None:
-        """Assert every committed segment's data is present and unmodified.
+        """Assert every referenced segment's data is present and unmodified.
 
-        Raw data is the source of truth; a committed file that was deleted,
-        replaced, or rewritten externally must fail every read path with a
-        typed error — the disposable summary must never become authoritative
-        over changed raw. This per-query probe compares size and mtime;
-        ``reconcile()`` verifies the full content hash.
+        Raw data is the source of truth; a committed file (active or
+        superseded history) that was deleted, replaced, or rewritten
+        externally must fail every read path with a typed error — the
+        disposable summary must never become authoritative over changed raw.
+        This per-query probe compares size and mtime against the fingerprints
+        recorded at commit time; ``reconcile()`` verifies full content
+        hashes.
         """
-        committed = self._committed_tokens()
-        stats = self._backend.stat_segments(committed)
-        missing = [token for token in committed if token not in stats]
+        referenced = self._referenced_tokens()
+        stats = self._backend.stat_segments(referenced)
+        missing = [token for token in referenced if token not in stats]
         if missing:
             raise StoreFormatError(
                 f"{len(missing)} committed segment(s) are missing from the store "
@@ -794,7 +872,7 @@ class ForecastArchive:
         registry = SegmentIntegrity.load(self._integrity_path)
         modified = [
             token
-            for token in committed
+            for token in referenced
             if (record := registry.entries.get(token)) is None
             or stats[token] != (record["size"], record["mtime_ns"])
         ]
@@ -852,7 +930,7 @@ class ForecastArchive:
         """
         self._verify_committed_segments()
         registry = SegmentIntegrity.load(self._integrity_path)
-        for token in self._committed_tokens():
+        for token in self._referenced_tokens():
             record = registry.entries.get(token)
             fingerprint = self._backend.fingerprint_segment(token)
             if record is None or fingerprint["sha256"] != record["sha256"]:
@@ -1079,11 +1157,15 @@ class ForecastArchive:
         model_version: str | None = None,
         series: str | Sequence[str] | None = None,
     ) -> pd.DataFrame:
-        """Every forecast known as of ``origin`` — what you would have seen then.
+        """The current record of all runs with origin on or before ``origin``.
 
-        Returns the raw rows with run date ``<= origin``, optionally scoped to
-        a model/version/series. No leakage: rows from later runs can never
-        appear, which makes this safe for honest backtests and audits.
+        An origin-time filter over the archive's current state (tech spec
+        FR-4.1), optionally scoped to a model/version/series. No leakage:
+        rows from later-origin runs can never appear — the guarantee honest
+        backtests need. It is *not* a transaction-time replay: an explicit
+        ``on_conflict="overwrite"`` revises what this returns for past
+        origins (supersession is recorded in the run manifest, and
+        ``ingested_at`` is retained for a future transaction-time surface).
         """
         return self._evaluator.as_of(
             origin, model_id=model_id, model_version=model_version, series=series

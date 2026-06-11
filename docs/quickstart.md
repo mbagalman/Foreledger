@@ -240,16 +240,20 @@ hidden. Versions whose model has a champion get a `delta_vs_champion`
 (negative = better on error metrics). `compare_curve(...)` gives the same
 head-to-head across all horizons.
 
-### What did we know on June 1st?
+### Which runs were dated on or before June 1st?
 
 ```python
 snapshot = archive.as_of("2026-06-01")
 print(len(snapshot))
 ```
 
-Returns every forecast whose run date is on or before that day — and nothing
-from later runs. This is the audit answer to "what drove the decision?" and
-the honest input to any backtest.
+Returns the current record of every run whose origin (run date) is on or
+before that day — and nothing from later-dated runs, which is the no-leakage
+guarantee a backtest needs. One honest caveat: this is an origin-time filter
+over current state, not a transaction-time replay — if you explicitly
+overwrite a past run with `on_conflict="overwrite"`, this view reflects the
+revision (the supersession is recorded in `runs.json`, and each row's
+`ingested_at` is retained for a future as-it-was-stored query surface).
 
 ### Don't trust a headline number? Drill into it.
 
