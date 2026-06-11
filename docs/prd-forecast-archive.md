@@ -7,6 +7,8 @@
 **Date:** 2026-06-10
 **Upstream artifacts:** none (Medium chain — BRD skipped by default; business context sourced from the uploaded concept brief and the go/no-go viability memo, marked user-confirmed below)
 
+> **Amended 2026-06-11 — result-status contract (ADR-007 amendment).** Where acceptance criteria below say targets lacking an actual are "reported insufficient", the ratified contract is three-state: `ok` (full coverage), `partial` (a value over the covered targets, with unscored targets counted in `n_missing_actuals` — the per-target insufficiency report), `insufficient` (nothing in scope scorable). Never silently substituted; `fallback="latest"` fills remain flagged.
+
 ## Assumptions and inferred inputs
 
 | Input | Source | If inferred or user-confirmed: notes |

@@ -35,6 +35,18 @@ def test_non_archive_directory_is_refused(tmp_path: Path) -> None:
     assert (target / "data.csv").read_text(encoding="utf-8") == "not an archive"
 
 
+def test_directory_with_arbitrary_tmp_file_is_refused(tmp_path: Path) -> None:
+    """Only the archive's own init plumbing is exempt from the non-archive
+    check — a user's .tmp file is still user content."""
+    target = tmp_path / "scratchpad"
+    target.mkdir()
+    (target / "notes.tmp").write_text("user data", encoding="utf-8")
+    with pytest.raises(StoreFormatError):
+        ForecastArchive(target)
+    assert (target / "notes.tmp").read_text(encoding="utf-8") == "user data"
+    assert not (target / "archive_meta.json").exists()
+
+
 def test_corrupt_metadata_is_a_typed_error(store: Path) -> None:
     ForecastArchive(store)
     (store / "archive_meta.json").write_text("{not json", encoding="utf-8")

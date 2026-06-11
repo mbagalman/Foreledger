@@ -272,6 +272,81 @@ def test_failed_actuals_append_after_designation_is_recoverable(
     archive.reconcile()
 
 
+def test_priority_token_encoding_is_delimiter_safe(store: Path) -> None:
+    """Review reproduction: source labels may contain the join delimiter, so
+    distinct priority lists must never collide to one summary token."""
+    first = ForecastArchive(store, source_priority=["a,b", "c"])
+    setup_forecasts(first)
+    ts = "2026-02-01T12:00:00"
+    first.register_actuals(one_target_frame(100.0), source="a,b", recorded_at=ts)
+    first.register_actuals(one_target_frame(120.0), source="c", recorded_at=ts)
+    assert mae_at_h1(first).status == "ok"  # "a,b" outranks "c"
+
+    # same comma-join, different semantics: neither tied source is covered,
+    # so the conflict is ambiguous and the target unscorable
+    reopened = ForecastArchive(store, source_priority=["a", "b,c"])
+    result = reopened.accuracy_at_horizon(1, model_id="alpha", model_version="v1", series="S1")
+    assert result.status == "insufficient"  # never the stale "ok" summary
+    reopened.reconcile()
+
+
+def test_failed_default_timestamp_official_registration_is_retryable(
+    archive: ForecastArchive, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed official registration leaves an orphan designation; a plain
+    retry through the same public call (default recorded_at) must supersede
+    the inert orphan, not raise OfficialConflictError."""
+    setup_forecasts(archive)
+
+    def failing(frame: pd.DataFrame) -> None:
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr(archive._backend, "append_actuals_segment", failing)
+    with pytest.raises(OSError):
+        archive.register_actuals(one_target_frame(100.0), source="rev1", official=True)
+    assert mae_at_h1(archive).status == "insufficient"
+    assert mae_at_h1(archive, basis="official").status == "insufficient"
+
+    monkeypatch.undo()
+    archive.register_actuals(one_target_frame(100.0), source="rev1", official=True)
+    assert mae_at_h1(archive).status == "ok"
+    assert mae_at_h1(archive, basis="official").status == "ok"
+    rows = archive.drill(
+        {"model_id": "alpha", "model_version": "v1", "horizon": 1, "basis": "official"}
+    )
+    assert list(rows["actual_value"]) == [100.0]
+    archive.reconcile()
+
+
+def test_orphan_recovery_does_not_weaken_live_stickiness(
+    archive: ForecastArchive,
+) -> None:
+    """Superseding inert orphans must not let a *live* official be replaced."""
+    setup_forecasts(archive)
+    archive.register_actuals(
+        one_target_frame(100.0), source="rev1", official=True, recorded_at="2026-02-01"
+    )
+    with pytest.raises(OfficialConflictError):
+        archive.register_actuals(one_target_frame(120.0), source="rev2", official=True)
+
+
+def test_unwritable_error_log_fails_registration_before_commit(store: Path) -> None:
+    """The conflict log is a required integrity channel: if it cannot be
+    written, the registration that needs it fails cleanly before any append
+    — never a successful commit with a silently lost signal."""
+    archive = ForecastArchive(store, error_log=store / "logdir")
+    (store / "logdir").mkdir()  # a directory: opening it for append fails
+    setup_forecasts(archive)
+    ts = "2026-02-01T12:00:00"
+    archive.register_actuals(one_target_frame(100.0), source="a", recorded_at=ts)
+
+    with pytest.raises(OSError):
+        archive.register_actuals(one_target_frame(110.0), source="b", recorded_at=ts)
+    # the conflicting row was never committed; the call is retryable
+    assert len(archive._backend.read_actuals()) == 1
+    assert mae_at_h1(archive).status == "ok"
+
+
 def test_failed_designation_append_leaves_nothing_visible(
     archive: ForecastArchive, monkeypatch: pytest.MonkeyPatch
 ) -> None:

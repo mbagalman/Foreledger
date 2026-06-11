@@ -130,17 +130,14 @@ class ForecastArchive:
 
     # -- store lifecycle ---------------------------------------------------
 
-    def _foreign_entries(self) -> bool:
-        """True when the store directory holds anything that is not ours.
+    #: The only files a concurrent constructor may legitimately observe in a
+    #: store before the metadata lands. Anything else — including arbitrary
+    #: ``*.tmp`` files — is user content and triggers the non-archive refusal.
+    _INIT_PLUMBING = frozenset({".foreledger.lock", "archive_meta.json.tmp"})
 
-        The lock file and in-flight ``.tmp`` files are archive plumbing, not
-        user content — concurrent constructors may legitimately observe them
-        before the metadata lands.
-        """
-        return any(
-            entry.name != ".foreledger.lock" and not entry.name.endswith(".tmp")
-            for entry in self.store.iterdir()
-        )
+    def _foreign_entries(self) -> bool:
+        """True when the store directory holds anything that is not ours."""
+        return any(entry.name not in self._INIT_PLUMBING for entry in self.store.iterdir())
 
     def _refuse_non_archive_dir(self) -> None:
         if not self.store.exists():
@@ -421,14 +418,28 @@ class ForecastArchive:
         """
         batch = canonicalize_actuals(frame, mapping, source, recorded_at, official)
         with self._lock():
+            existing = self._backend.read_actuals()
             # Enforce the (series, target, source, recorded_at) identity
             # against the existing log: exact replays collapse, differing
             # values raise — both before anything is appended.
-            new_rows = dedup_against_log(batch, self._backend.read_actuals())
+            new_rows = dedup_against_log(batch, existing)
+            # Conflict bookkeeping runs against the would-be log BEFORE any
+            # append: if the required error-log destination cannot be
+            # written, the whole registration fails cleanly and retryably
+            # instead of committing data whose integrity signal was lost.
+            if new_rows.empty:
+                combined = existing
+            elif existing.empty:
+                combined = new_rows
+            else:
+                combined = pd.concat([existing, new_rows], ignore_index=True)
+            self._log_new_conflicts(combined)
             if official:
                 # Designations reference the full canonical batch: a replayed
                 # row already in the log may still need its designation.
-                designations = check_official_registration(batch, self._backend.read_officials())
+                designations = check_official_registration(
+                    batch, self._backend.read_officials(), existing
+                )
                 if not designations.empty:
                     designations = designations.copy()
                     designations["designated_at"] = pd.Timestamp.now()
@@ -436,20 +447,12 @@ class ForecastArchive:
                     # actual is inert (the official join finds nothing and
                     # latest is untouched), whereas an actual without its
                     # designation would already move latest-basis accuracy.
-                    # A retry with the same recorded_at completes the pair.
+                    # A retry — any timestamp — completes or supersedes it.
                     self._backend.append_officials_segment(designations)
             self._backend.append_actuals_segment(new_rows)
             logger.info(
                 "registered %d actual(s)%s", len(new_rows), " as official" if official else ""
             )
-            try:
-                self._log_new_conflicts()
-            except Exception:
-                # bookkeeping only: the registration is durable and resolution
-                # still excludes ambiguous targets; don't fail the write
-                logger.warning(
-                    "conflict bookkeeping failed after a durable registration", exc_info=True
-                )
         self._refresh_summary_after_write()
 
     def mark_official(
@@ -538,7 +541,9 @@ class ForecastArchive:
             digest.update(f"{component}\n".encode())
         for component in sorted(self._registry.token_components()):
             digest.update(f"{component}\n".encode())
-        digest.update(f"priority:{','.join(self._source_priority or [])}\n".encode())
+        # JSON, not a join: source labels are opaque user strings and may
+        # contain any delimiter, so only a structured encoding is collision-free
+        digest.update(f"priority:{json.dumps(self._source_priority or [])}\n".encode())
         return digest.hexdigest()
 
     def _valid_summary(self) -> pd.DataFrame | None:
@@ -607,10 +612,17 @@ class ForecastArchive:
                 f"recomputation ({len(recomputed_sorted)} cells)"
             )
 
-    def _log_new_conflicts(self) -> None:
+    def _log_new_conflicts(self, actuals: pd.DataFrame) -> None:
         """Write newly observed unresolved same-timestamp conflicts to the
-        dedicated error-log file (a data-integrity channel, not app logging)."""
-        actuals = self._backend.read_actuals()
+        dedicated error-log file (a data-integrity channel, not app logging).
+
+        Called with the *would-be* log before the rows are appended, so a
+        failure here aborts the registration instead of committing data whose
+        integrity signal was lost. The flip side: if the registration crashes
+        after this point, an entry may describe a conflict that only
+        materializes on retry — a false positive in the loud channel, which
+        beats a silent miss.
+        """
         resolved = resolve_effective_latest(actuals, self._source_priority)
         if not resolved.conflicts:
             return
@@ -673,9 +685,12 @@ class ForecastArchive:
 
         Returns
         -------
-        AccuracyResult — value and sample count when computable, or an
-        explicit ``status="insufficient"`` with the missing-actuals count.
-        Missing actuals never read as a silent zero/NaN.
+        AccuracyResult with a three-state status (ADR-007 amendment
+        2026-06-11): ``"ok"`` — every forecast in scope was scored;
+        ``"partial"`` — a value over the covered pairs, with unscored
+        forecasts counted in ``n_missing_actuals``; ``"insufficient"`` —
+        nothing in scope could be scored (``value`` is ``None``). Missing
+        actuals never read as a silent zero/NaN.
         """
         return self._evaluator.accuracy_at_horizon(
             h,

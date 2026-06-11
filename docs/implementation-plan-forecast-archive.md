@@ -9,6 +9,8 @@
 
 > **Amended 2026-06-10** for post-draft requirements: model/version axis in the schema (ADR-006); a warehouse-ready seam with Snowflake as a v1.1 fast-follow (amended ADR-002); an optional champion designation on comparison (ADR-006 note); and revisable actuals with an optional "official" value and selectable accuracy basis (ADR-007). New Phase 6 covers the Snowflake backend (does not gate the v1 release).
 
+> **Amended 2026-06-11 — result-status contract (ADR-007 amendment).** The gate criteria below that say missing (official) actuals are "reported insufficient" are ratified as the three-state status contract: `ok` (full coverage), `partial` (value over covered pairs; unscored forecasts counted in `n_missing_actuals`), `insufficient` (nothing scorable). Never a silent substitution or a coverage gap that reads as complete.
+
 ## Assumptions and inferred inputs
 
 | Input | Source | If inferred or user-confirmed: notes |

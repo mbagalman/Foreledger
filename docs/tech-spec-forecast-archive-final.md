@@ -9,6 +9,8 @@
 
 > **Amended 2026-06-10** to incorporate post-draft requirements: (1) **multiple models and versions, including parallel runs** — model/version added to the grain and identity per **ADR-006**, plus an optional **champion** designation on comparison; (2) **enterprise-warehouse storage** — the backend seam is now warehouse-ready with Snowflake as the committed fast-follow per the **amended ADR-002**; (3) **revisable actuals with an optional "official" value** — the actuals layer is an append-only revisable log with selectable accuracy basis (`latest`/`official`) per **ADR-007**.
 
+> **Amended 2026-06-11 — result-status contract (ADR-007 amendment).** Wherever this spec says missing (official) actuals are "reported insufficient", the ratified contract is three-state: results carry `status="ok"` (full coverage), `"partial"` (a value over the covered pairs, with unscored forecasts counted in `n_missing_actuals` — the per-target insufficiency report), or `"insufficient"` (nothing in scope scorable; no value). Missing targets are never silently substituted; `fallback="latest"` fills are flagged as before. See ADR-007's 2026-06-11 amendment for rationale.
+
 ## Assumptions and inferred inputs
 
 | Input | Source | If inferred or user-confirmed: notes |

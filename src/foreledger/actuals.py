@@ -243,18 +243,31 @@ def current_designations(officials: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def check_official_registration(batch: pd.DataFrame, officials: pd.DataFrame) -> pd.DataFrame:
+def check_official_registration(
+    batch: pd.DataFrame, officials: pd.DataFrame, actuals: pd.DataFrame
+) -> pd.DataFrame:
     """Validate an ``official=True`` registration against existing designations.
 
     Returns the designation rows to append. Raises before any append if a
-    target already has a *different* official row — stickiness means only the
-    explicit ``mark_official`` path may change a designation.
+    target already has a different *live* official row — stickiness means
+    only the explicit ``mark_official`` path may change a designation.
+
+    A designation that dereferences no registered actual is an **orphan**:
+    the durable leftover of a registration whose actual append failed. It is
+    observably inert (the official basis never resolved it), so a new
+    official registration for that target supersedes it instead of
+    conflicting — this is what makes a failed default-timestamp registration
+    retryable through the same public call.
     """
     existing = current_designations(officials)
     to_append = batch[["series_id", "target", "source", "actual_recorded_at"]].copy()
     if not existing.empty:
+        live_marker = existing.merge(
+            actuals[_IDENTITY].drop_duplicates(), on=_IDENTITY, how="left", indicator=True
+        )
+        live_marker["is_live"] = live_marker["_merge"] == "both"
         merged = to_append.merge(
-            existing,
+            live_marker.drop(columns="_merge"),
             on=["series_id", "target"],
             how="left",
             suffixes=("", "_existing"),
@@ -265,16 +278,17 @@ def check_official_registration(batch: pd.DataFrame, officials: pd.DataFrame) ->
             & (merged["source_existing"] == merged["source"])
             & (merged["actual_recorded_at_existing"] == merged["actual_recorded_at"])
         )
-        conflicting = has_existing & ~same_row
+        is_live = merged["is_live"].fillna(False).astype(bool)
+        conflicting = has_existing & ~same_row & is_live
         if conflicting.any():
             raise OfficialConflictError(
                 f"{int(conflicting.sum())} target(s) already have a different "
                 "official actual; the designation is sticky — use mark_official "
                 "to change it explicitly"
             )
-        to_append = merged.loc[
-            ~has_existing, ["series_id", "target", "source", "actual_recorded_at"]
-        ]
+        # append for new targets, and to supersede inert orphan designations
+        keep = ~has_existing | (~same_row & ~is_live)
+        to_append = merged.loc[keep, ["series_id", "target", "source", "actual_recorded_at"]]
     return to_append.reset_index(drop=True)
 
 
