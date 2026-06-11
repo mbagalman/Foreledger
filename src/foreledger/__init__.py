@@ -20,6 +20,7 @@ from .errors import (
     OfficialConflictError,
     ReconciliationError,
     StoreFormatError,
+    StoreLockTimeout,
     UnknownMetricError,
     ValidationError,
 )
@@ -40,6 +41,7 @@ __all__ = [
     "OfficialConflictError",
     "ReconciliationError",
     "StoreFormatError",
+    "StoreLockTimeout",
     "UnknownMetricError",
     "ValidationError",
     "__version__",

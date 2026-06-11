@@ -21,6 +21,7 @@ per series/period for the textbook reading.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import threading
 from collections.abc import Callable
@@ -94,12 +95,29 @@ BUILTIN_SIMPLE: dict[str, MetricFn] = {"MAE": mae, "RMSE": rmse, "MAPE": mape}
 BUILTIN_NAMES = ("MAE", "RMSE", "MAPE", "MASE")
 
 
+def implementation_fingerprint(fn: MetricFn) -> str:
+    """A stable identity for a metric implementation.
+
+    Hashes the function's bytecode and constants so re-registering a *changed*
+    implementation under the same name invalidates the summary's state token,
+    while the same source re-registered (e.g. after a restart) keeps it valid.
+    Closure-captured values are not visible to this hash; a metric whose result
+    depends on enclosing state should be registered under a new name.
+    """
+    code = getattr(fn, "__code__", None)
+    if code is None:
+        return "opaque"
+    payload = code.co_code + repr(code.co_consts).encode() + repr(code.co_names).encode()
+    return hashlib.sha256(payload).hexdigest()[:16]
+
+
 @dataclass(frozen=True)
 class RegisteredMetric:
     name: str
     fn: MetricFn
     summarizable: bool
     builtin: bool
+    fingerprint: str = "builtin"
 
 
 class MetricRegistry:
@@ -125,7 +143,13 @@ class MetricRegistry:
             raise ValidationError("metric name must be a non-empty string")
         if name in self._metrics and self._metrics[name].builtin:
             raise ValidationError(f"cannot replace built-in metric {name!r}")
-        self._metrics[name] = RegisteredMetric(name, fn, summarizable=summarizable, builtin=False)
+        self._metrics[name] = RegisteredMetric(
+            name,
+            fn,
+            summarizable=summarizable,
+            builtin=False,
+            fingerprint=implementation_fingerprint(fn),
+        )
         self._quarantined.discard(name)
         logger.info("registered metric (summarizable=%s)", summarizable)
 
@@ -139,6 +163,14 @@ class MetricRegistry:
 
     def names(self, summarizable_only: bool = False) -> list[str]:
         return [m.name for m in self._metrics.values() if m.summarizable or not summarizable_only]
+
+    def token_components(self) -> list[str]:
+        """Identity strings for the summarizable metric set, including each
+        implementation's fingerprint — replacing a metric under the same name
+        must invalidate any summary computed with the old implementation."""
+        return [
+            f"metric:{m.name}:{m.fingerprint}" for m in self._metrics.values() if m.summarizable
+        ]
 
     def evaluate(
         self,

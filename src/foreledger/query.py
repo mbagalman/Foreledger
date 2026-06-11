@@ -5,17 +5,20 @@ exactly and falls back to raw computation otherwise, invisibly; the two paths
 share :func:`foreledger.summary.metric_over_pairs`, so they can never
 silently diverge.
 
-Missing actuals are an explicit insufficient result. Under
-``basis="official"``, targets with no official actual are reported
-insufficient unless the caller opts into ``fallback="latest"``, which fills
-them from the latest value and flags them in the result.
+Missing actuals are always explicit: forecasts without a usable actual are
+counted in ``n_missing_actuals`` and downgrade the status to ``partial``; a
+scope where nothing can be scored is ``insufficient``. Under
+``basis="official"``, targets with no official actual count as missing —
+never silently substituted — unless the caller opts into
+``fallback="latest"``, which fills them from the latest value and flags them
+in the result.
 """
 
 from __future__ import annotations
 
 import math
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any
+from typing import Any, Literal
 
 import pandas as pd
 
@@ -48,6 +51,15 @@ def _series_list(series: str | Sequence[str] | None) -> list[str] | None:
     if isinstance(series, str):
         return [series]
     return [str(s) for s in series]
+
+
+def _coverage_status(usable: bool, n_missing: int) -> Literal["ok", "partial", "insufficient"]:
+    """Status reflects both computability and coverage: a value over an
+    incompletely covered scope is explicitly ``partial``, never a quiet
+    ``ok`` that reads as complete."""
+    if not usable:
+        return "insufficient"
+    return "partial" if n_missing > 0 else "ok"
 
 
 class Evaluator:
@@ -153,13 +165,13 @@ class Evaluator:
         n_missing = int((~matched).sum())
         n_fallback = int(pairs["is_fallback"].sum()) if not pairs.empty else 0
         value, n = metric_over_pairs(self._registry, metric, pairs)
-        ok = n > 0 and value is not None and math.isfinite(value)
+        usable = n > 0 and value is not None and math.isfinite(value)
         return AccuracyResult(
             metric=metric,
             horizon=int(horizon),
             basis=basis,
-            status="ok" if ok else "insufficient",
-            value=float(value) if ok and value is not None else None,
+            status=_coverage_status(usable, n_missing),
+            value=float(value) if usable and value is not None else None,
             n=n,
             n_missing_actuals=n_missing,
             fallback_used=fallback is not None and n_fallback > 0,
@@ -194,13 +206,13 @@ class Evaluator:
         value = float(row["value"].iloc[0])
         n = int(row["n"].iloc[0])
         n_forecasts = int(row["n_forecasts"].iloc[0])
-        ok = n > 0 and math.isfinite(value)
+        usable = n > 0 and math.isfinite(value)
         return AccuracyResult(
             metric=metric,
             horizon=int(horizon),
             basis=basis,
-            status="ok" if ok else "insufficient",
-            value=value if ok else None,
+            status=_coverage_status(usable, n_forecasts - n),
+            value=value if usable else None,
             n=n,
             n_missing_actuals=n_forecasts - n,
             served_from="summary",

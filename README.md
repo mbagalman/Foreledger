@@ -45,9 +45,10 @@ signed off on — and Foreledger answers, instantly and reproducibly:
    past date, with no hindsight leaking in. The forecast that drove the March
    decision is one query away.
 
-When the data can't support an honest answer — actuals missing, sources
-conflicting — Foreledger says *"insufficient data"* out loud rather than
-serving a number that looks like perfect accuracy.
+When the data can't fully support an answer, Foreledger says so out loud: a
+scope with gaps is flagged *partial* with the missing count attached, and one
+where nothing can be scored is an explicit *insufficient* — never a number
+that quietly reads as perfect accuracy.
 
 ## Quick start
 

@@ -155,6 +155,48 @@ def test_builtin_metrics_cannot_be_replaced(populated: ForecastArchive) -> None:
         populated.register_metric("MAE", lambda f, a: 0.0)
 
 
+def test_reregistered_metric_never_serves_the_old_implementation(
+    populated: ForecastArchive,
+) -> None:
+    """Review reproduction: replacing a summarizable metric under the same
+    name must invalidate summary cells computed with the old implementation."""
+
+    def custom_v1(forecast: FloatArray, actual: FloatArray) -> float:
+        return 1.0
+
+    populated.register_metric("Custom", custom_v1, summarizable=True)
+    first = populated.accuracy_at_horizon(1, metric="Custom", model_id="alpha", model_version="v1")
+    assert first.value == 1.0
+
+    def custom_v2(forecast: FloatArray, actual: FloatArray) -> float:
+        return 2.0
+
+    populated.register_metric("Custom", custom_v2, summarizable=True)
+    replaced = populated.accuracy_at_horizon(
+        1, metric="Custom", model_id="alpha", model_version="v1"
+    )
+    assert replaced.value == 2.0  # never the stale 1.0
+    populated.reconcile()
+
+
+def test_corrupt_summary_file_falls_back_to_raw(populated: ForecastArchive) -> None:
+    expected = populated.accuracy_at_horizon(1, model_id="alpha", model_version="v1")
+    (populated.store / "summary" / "summary.parquet").write_bytes(b"not parquet at all")
+
+    # the disposable cache is treated as absent, never as a query error
+    result = populated.accuracy_at_horizon(1, model_id="alpha", model_version="v1")
+    assert result.served_from == "raw"
+    assert result.value == expected.value
+
+    # and it is repairable in place
+    populated.rebuild_summary()
+    populated.reconcile()
+    assert (
+        populated.accuracy_at_horizon(1, model_id="alpha", model_version="v1").served_from
+        == "summary"
+    )
+
+
 def test_summary_grain_includes_model_and_version(populated: ForecastArchive) -> None:
     stored = stored_summary(populated)
     pairs = set(zip(stored["model_id"], stored["model_version"], strict=True))

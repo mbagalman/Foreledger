@@ -20,6 +20,14 @@ class StoreFormatError(ForecastArchiveError):
     """
 
 
+class StoreLockTimeout(ForecastArchiveError):
+    """The cross-process store lock could not be acquired in time.
+
+    Another writer is holding it (or crashed while holding it on a platform
+    where locks outlive the process — OS locks normally release on exit).
+    """
+
+
 class ValidationError(ForecastArchiveError):
     """User-supplied frame, mapping, or argument failed validation."""
 

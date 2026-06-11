@@ -13,7 +13,7 @@ from typing import Any, Literal
 
 import pandas as pd
 
-Status = Literal["ok", "insufficient"]
+Status = Literal["ok", "partial", "insufficient"]
 Basis = Literal["latest", "official"]
 
 
@@ -26,11 +26,15 @@ class AccuracyResult:
     metric, horizon, basis:
         What was asked: the metric name, horizon in days, and actuals basis.
     status:
-        ``"ok"`` when a finite value was computed over at least one pair;
-        ``"insufficient"`` when actuals are missing/ambiguous or the metric
-        is undefined on the data.
+        ``"ok"`` — every forecast in scope was scored against an actual.
+        ``"partial"`` — a finite value was computed, but some forecasts had
+        no usable actual (see ``n_missing_actuals``); the gap is explicit,
+        never silently absorbed into an "ok".
+        ``"insufficient"`` — nothing could be scored (no actuals, all
+        ambiguous, or the metric is undefined on the data).
     value:
-        The metric value, or ``None`` when insufficient.
+        The metric value over the covered pairs, or ``None`` when
+        insufficient.
     n:
         Number of forecast/actual pairs the value covers.
     n_missing_actuals:
@@ -57,7 +61,8 @@ class AccuracyResult:
 
     @property
     def ok(self) -> bool:
-        return self.status == "ok"
+        """True when a usable value exists (``ok`` or ``partial``)."""
+        return self.status != "insufficient"
 
 
 @dataclass(frozen=True)
@@ -96,7 +101,7 @@ class AccuracyCurve:
         if ax is None:
             _, ax = plt.subplots()
         frame = self.to_frame()
-        usable = frame[frame["status"] == "ok"]
+        usable = frame[frame["status"] != "insufficient"]
         ax.plot(usable["horizon"], usable["value"], marker="o")
         ax.set_xlabel("horizon (days)")
         ax.set_ylabel(self.metric)

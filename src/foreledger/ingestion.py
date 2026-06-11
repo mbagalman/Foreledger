@@ -22,7 +22,7 @@ import logging
 import os
 import uuid
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -56,6 +56,22 @@ class RunRecord:
         return (self.model_id, self.model_version, self.origin, self.series_id)
 
 
+def load_manifest_entries(path: Path) -> list[dict[str, Any]]:
+    """Raw manifest entries, with corruption surfaced as a typed error."""
+    from .errors import StoreFormatError
+
+    if not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        entries = payload.get("runs", [])
+        if not isinstance(entries, list):
+            raise TypeError("runs is not a list")
+    except (json.JSONDecodeError, TypeError, AttributeError) as exc:
+        raise StoreFormatError(f"run manifest at {path} is unreadable or corrupt") from exc
+    return entries
+
+
 @dataclass
 class RunManifest:
     """Append-style run bookkeeping; the single source of forecast visibility."""
@@ -64,12 +80,21 @@ class RunManifest:
     runs: list[RunRecord] = field(default_factory=list)
 
     @classmethod
-    def load(cls, path: Path) -> RunManifest:
-        if not path.exists():
-            return cls(path=path)
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        runs = [RunRecord(**entry) for entry in payload.get("runs", [])]
+    def from_entries(cls, path: Path, entries: list[dict[str, Any]]) -> RunManifest:
+        from .errors import StoreFormatError
+
+        try:
+            runs = [RunRecord(**entry) for entry in entries]
+        except TypeError as exc:
+            raise StoreFormatError(
+                f"run manifest at {path} has an unrecognized record shape; it may "
+                "have been written by an incompatible foreledger version"
+            ) from exc
         return cls(path=path, runs=runs)
+
+    @classmethod
+    def load(cls, path: Path) -> RunManifest:
+        return cls.from_entries(path, load_manifest_entries(path))
 
     def save(self) -> None:
         payload = {"runs": [asdict(run) for run in self.runs]}
@@ -278,13 +303,18 @@ def commit_runs(
     manifest: RunManifest,
     write_segment: Any,
     now: pd.Timestamp,
-) -> IngestResult:
+) -> tuple[IngestResult, RunManifest]:
     """Write one invisible segment for the whole call, then commit visibility
     in one atomic manifest save.
 
     The segment file carries one ``run_id`` per planned (origin, series) run;
     visibility is row-level via the manifest's active run_ids, so superseding
     one series later never hides its neighbours in the same file.
+
+    ``manifest`` is never mutated: a candidate manifest is built and saved,
+    and returned only after the save succeeds. If anything raises, the caller
+    keeps its committed view — no uncommitted rows ever become visible on the
+    live object.
     """
     new_records: list[RunRecord] = []
     tagged_frames: list[pd.DataFrame] = []
@@ -311,24 +341,25 @@ def commit_runs(
     for record in new_records:
         record.segment = segment
 
-    superseded = 0
-    for plan in planned:
-        if plan.supersedes is not None:
-            plan.supersedes.superseded = True
-            superseded += 1
-    manifest.runs.extend(new_records)
-    manifest.save()
+    superseded_ids = {plan.supersedes.run_id for plan in planned if plan.supersedes is not None}
+    candidate_runs = [
+        replace(run, superseded=True) if run.run_id in superseded_ids else run
+        for run in manifest.runs
+    ]
+    candidate = RunManifest(path=manifest.path, runs=[*candidate_runs, *new_records])
+    candidate.save()
 
     n_rows = sum(len(frame) for frame in tagged_frames)
     logger.info(
         "ingest committed: %d run(s), %d row(s), %d superseded",
         len(new_records),
         n_rows,
-        superseded,
+        len(superseded_ids),
     )
-    return IngestResult(
+    result = IngestResult(
         n_rows=n_rows,
         n_runs_written=len(new_records),
         n_runs_skipped=0,
-        n_runs_superseded=superseded,
+        n_runs_superseded=len(superseded_ids),
     )
+    return result, candidate

@@ -10,6 +10,7 @@ crashed ingest leaves the archive at its pre-run state.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import uuid
 from pathlib import Path
@@ -20,6 +21,8 @@ import pandas as pd
 
 from ..schema import empty_actuals, empty_forecasts
 from .base import Backend, Dialect, ForecastFilter, build_forecast_predicate
+
+logger = logging.getLogger("foreledger.backend")
 
 DUCKDB_DIALECT = Dialect(name="duckdb", placeholder="?")
 
@@ -152,13 +155,19 @@ class DuckDBBackend(Backend):
         meta_path = self.summary_dir / "summary_meta.json"
         if not path.exists() or not meta_path.exists():
             return None
+        # The summary is a disposable cache: any read or schema failure is
+        # cache invalidation (rebuildable from raw), never a query error.
         try:
             token = str(json.loads(meta_path.read_text(encoding="utf-8"))["state_token"])
-        except (ValueError, KeyError, json.JSONDecodeError):
+            frame = pd.read_parquet(path)
+            frame["horizon"] = frame["horizon"].astype("int64")
+            frame["n"] = frame["n"].astype("int64")
+        except Exception:
+            logger.warning(
+                "stored summary is unreadable; treating it as absent (it will be rebuilt from raw)",
+                exc_info=True,
+            )
             return None
-        frame = pd.read_parquet(path)
-        frame["horizon"] = frame["horizon"].astype("int64")
-        frame["n"] = frame["n"].astype("int64")
         return frame, token
 
     def raw_state_components(self) -> list[str]:

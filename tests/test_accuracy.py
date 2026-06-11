@@ -62,6 +62,7 @@ def test_official_basis_summary_and_raw_agree(populated: ForecastArchive) -> Non
     result = populated.accuracy_at_horizon(1, basis="official", model_id="beta", model_version="v1")
     assert result.served_from == "summary"
     # partial official coverage must be visible, not read as complete
+    assert result.status == "partial"
     assert result.n_missing_actuals > 0
     summary_file = populated.store / "summary" / "summary.parquet"
     summary_file.unlink()
@@ -83,7 +84,7 @@ def test_routes_report_identical_results_under_partial_coverage(
     kwargs = {"metric": "MAE", "model_id": "alpha", "model_version": "v9"}
     summary_res = populated.accuracy_at_horizon(5, **kwargs)
     assert summary_res.served_from == "summary"
-    assert summary_res.status == "ok"
+    assert summary_res.status == "partial"  # gaps are explicit, never an "ok"
     assert summary_res.n_missing_actuals > 0
 
     (populated.store / "summary" / "summary.parquet").unlink()

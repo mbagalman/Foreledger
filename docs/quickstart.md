@@ -168,10 +168,12 @@ Things Foreledger handles that ad-hoc scoring scripts get wrong:
   ```
 
 - **Missing actuals are visible, never flattering.** Forecast rows without a
-  usable actual are excluded from the metric and counted in the result's
-  `n_missing_actuals` — identically on the precomputed and raw query paths.
-  A scope where *nothing* can be scored comes back as an explicit
-  `status="insufficient"`, never a zero that reads as perfect accuracy.
+  usable actual are excluded from the metric, counted in the result's
+  `n_missing_actuals`, and downgrade the result to `status="partial"` —
+  identically on the precomputed and raw query paths. A scope where
+  *nothing* can be scored comes back as an explicit `status="insufficient"`,
+  never a zero that reads as perfect accuracy. `status="ok"` means full
+  coverage, nothing less.
 
 ## 5. Ask the questions
 
@@ -211,9 +213,10 @@ print(filled.value, filled.n_fallback)
 ```
 
 Under `basis="official"`, targets without an official actual count toward
-`n_missing_actuals` — they are never silently substituted. The explicit
-`fallback="latest"` opt-in fills them from the latest value and reports how
-many were filled (`n_fallback`).
+`n_missing_actuals` and cap the status at `partial` — they are never
+silently substituted, and a scope with no official actuals at all is
+`insufficient`. The explicit `fallback="latest"` opt-in fills the gaps from
+the latest value and reports how many were filled (`n_fallback`).
 
 ### Which model wins?
 

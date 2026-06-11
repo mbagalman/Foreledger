@@ -101,27 +101,51 @@ def test_crashed_ingest_leaves_pre_run_state(archive: ForecastArchive) -> None:
     assert total_rows(archive) == len(frame)
 
 
-def test_crash_between_segment_write_and_manifest_commit(archive: ForecastArchive) -> None:
+def test_crash_between_segment_write_and_manifest_commit(
+    archive: ForecastArchive, monkeypatch: pytest.MonkeyPatch
+) -> None:
     frame = forecast_frame(1.0)
-    original_save = archive._manifest.save
 
-    def failing_save() -> None:
+    def failing_save(self: object) -> None:
         raise RuntimeError("simulated crash before visibility commit")
 
-    archive._manifest.save = failing_save  # type: ignore[method-assign]
+    monkeypatch.setattr("foreledger.ingestion.RunManifest.save", failing_save)
     with pytest.raises(RuntimeError):
         archive.ingest(frame, model_id="alpha", model_version="v1")
 
-    # the segment file exists on disk but was never committed: invisible
-    archive._manifest.runs.clear()  # drop in-memory records from the failed call
+    # the same live object sees no uncommitted rows: the failed commit never
+    # touched its manifest (the candidate was discarded with the exception)
     assert total_rows(archive) == 0
+    assert archive.list_models().empty
 
-    archive._manifest.save = original_save  # type: ignore[method-assign]
+    monkeypatch.undo()
     result = archive.ingest(frame, model_id="alpha", model_version="v1")
     assert result.n_runs_written == RUNS_PER_INGEST
     assert total_rows(archive) == len(frame)
     assert grain_is_unique(archive)
     archive.reconcile()
+
+
+def test_failed_overwrite_leaves_prior_run_active(
+    archive: ForecastArchive, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    frame = forecast_frame(1.0)
+    archive.ingest(frame, model_id="alpha", model_version="v1")
+    changed = frame.copy()
+    changed["value"] = changed["value"] + 1.0
+
+    def failing_save(self: object) -> None:
+        raise RuntimeError("simulated crash during overwrite commit")
+
+    monkeypatch.setattr("foreledger.ingestion.RunManifest.save", failing_save)
+    with pytest.raises(RuntimeError):
+        archive.ingest(changed, model_id="alpha", model_version="v1", on_conflict="overwrite")
+
+    # the prior run is still active and serves its original values
+    rows = archive.as_of("2100-01-01")
+    assert len(rows) == len(frame)
+    merged = rows.merge(frame, on=["series_id", "origin", "target"], suffixes=("", "_orig"))
+    assert (merged["value"] == merged["value_orig"]).all()
 
 
 def test_subset_replay_does_not_duplicate_grain(archive: ForecastArchive) -> None:

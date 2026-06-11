@@ -16,6 +16,7 @@ import hashlib
 import json
 import logging
 import os
+import uuid
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -32,7 +33,17 @@ from .actuals import (
 )
 from .backend import Backend, ForecastFilter, create_backend
 from .errors import ReconciliationError, StoreFormatError, ValidationError
-from .ingestion import IngestResult, RunManifest, canonicalize_forecasts, commit_runs, plan_runs
+from .ingestion import (
+    IngestResult,
+    RunManifest,
+    RunRecord,
+    canonicalize_forecasts,
+    commit_runs,
+    content_hash,
+    load_manifest_entries,
+    plan_runs,
+)
+from .locking import StoreLock
 from .metrics import DEFAULT_METRIC_TIMEOUT, MetricFn, MetricRegistry
 from .query import Evaluator, Period
 from .results import AccuracyCurve, AccuracyResult
@@ -84,7 +95,8 @@ class ForecastArchive:
         self.store = Path(store)
         self._check_or_init_store()
         self._backend: Backend = create_backend(backend, self.store)
-        self._manifest = RunManifest.load(self.store / "runs.json")
+        self._manifest_path = self.store / "runs.json"
+        self._manifest = self._load_manifest()
         self._champions_path = self.store / "champions.json"
         self._conflicts_logged_path = self.store / "conflicts_logged.json"
         self._error_log = (
@@ -94,12 +106,19 @@ class ForecastArchive:
         self._registry = MetricRegistry(timeout=metric_timeout)
         self._evaluator = Evaluator(
             backend=self._backend,
-            active_run_ids=self._manifest.active_run_ids,
+            # late-bound: writes replace self._manifest with a fresh snapshot
+            active_run_ids=lambda: self._manifest.active_run_ids(),
             registry=self._registry,
             source_priority=self._source_priority,
             champions=self.champions,
             summary_provider=self._valid_summary,
         )
+
+    def _lock(self) -> StoreLock:
+        """The cross-process lock serializing all read-modify-replace metadata
+        updates (manifest, champions, conflict bookkeeping). Acquired only by
+        the public write methods — helpers never re-acquire it."""
+        return StoreLock(self.store / ".foreledger.lock")
 
     # -- store lifecycle ---------------------------------------------------
 
@@ -137,6 +156,75 @@ class ForecastArchive:
         tmp = meta_path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload, indent=1), encoding="utf-8")
         os.replace(tmp, meta_path)
+
+    def _load_manifest(self) -> RunManifest:
+        """Load the run manifest, migrating legacy (per series-set) records.
+
+        Corruption or an unrecognized shape raises :class:`StoreFormatError`;
+        the archive never guesses at run visibility.
+        """
+        entries = load_manifest_entries(self._manifest_path)
+        if any("series_key" in entry for entry in entries):
+            with self._lock():
+                # re-read under the lock: another handle may have migrated
+                entries = load_manifest_entries(self._manifest_path)
+                if any("series_key" in entry for entry in entries):
+                    return self._migrate_legacy_manifest(entries)
+        return RunManifest.from_entries(self._manifest_path, entries)
+
+    def _migrate_legacy_manifest(self, entries: list[dict[str, Any]]) -> RunManifest:
+        """Deterministically migrate per-series-set run records (pre-57930cc)
+        to per-series records, preserving format version 1.
+
+        Each active legacy run's rows are re-tagged with per-series run_ids in
+        a new segment; the legacy segment files stay on disk (never deleted)
+        but are no longer referenced. Crash-safe: the manifest is replaced
+        atomically last, so an interrupted migration simply reruns.
+        """
+        legacy = [e for e in entries if "series_key" in e]
+        modern = [e for e in entries if "series_key" not in e]
+        records = RunManifest.from_entries(self._manifest_path, modern).runs
+
+        migrated: list[RunRecord] = []
+        tagged_frames: list[pd.DataFrame] = []
+        for entry in legacy:
+            if entry.get("superseded"):
+                continue  # invisible before the migration, invisible after
+            rows = self._backend.read_forecasts(
+                ForecastFilter(active_run_ids=[str(entry["run_id"])])
+            )
+            for series_id, group in rows.groupby("series_id", sort=True):
+                run_id = uuid.uuid4().hex
+                frame = group.copy()
+                frame["run_id"] = run_id
+                tagged_frames.append(frame)
+                migrated.append(
+                    RunRecord(
+                        run_id=run_id,
+                        model_id=str(entry["model_id"]),
+                        model_version=str(entry["model_version"]),
+                        origin=str(entry["origin"]),
+                        series_id=str(series_id),
+                        content_hash=content_hash(group),
+                        segment="",
+                        ingested_at=str(entry["ingested_at"]),
+                    )
+                )
+        if tagged_frames:
+            segment = self._backend.write_forecast_segment(
+                pd.concat(tagged_frames, ignore_index=True)
+            )
+            for record in migrated:
+                record.segment = segment
+
+        manifest = RunManifest(path=self._manifest_path, runs=[*records, *migrated])
+        manifest.save()
+        logger.info(
+            "migrated %d legacy run record(s) to %d per-series record(s)",
+            len(legacy),
+            len(migrated),
+        )
+        return manifest
 
     # -- write surface -------------------------------------------------------
 
@@ -182,21 +270,28 @@ class ForecastArchive:
         different model/version always adds rows — parallel versions coexist.
         """
         canonical = canonicalize_forecasts(frame, mapping, model_id, model_version, origin)
-        planned, skipped = plan_runs(canonical, self._manifest, on_conflict)
-        if not planned:
-            logger.info("ingest was a no-op: %d run(s) already present", skipped)
-            # An idempotent replay is also the retry path after a failed
-            # summary refresh — repair the summary before returning.
-            self._refresh_summary_after_write()
-            return IngestResult(
-                n_rows=0, n_runs_written=0, n_runs_skipped=skipped, n_runs_superseded=0
+        with self._lock():
+            # plan against a fresh snapshot so concurrent handles merge
+            # instead of clobbering each other's committed runs
+            self._manifest = RunManifest.load(self._manifest_path)
+            planned, skipped = plan_runs(canonical, self._manifest, on_conflict)
+            if not planned:
+                logger.info("ingest was a no-op: %d run(s) already present", skipped)
+                # An idempotent replay is also the retry path after a failed
+                # summary refresh — repair the summary before returning.
+                self._refresh_summary_after_write()
+                return IngestResult(
+                    n_rows=0, n_runs_written=0, n_runs_skipped=skipped, n_runs_superseded=0
+                )
+            result, committed = commit_runs(
+                planned,
+                self._manifest,
+                self._backend.write_forecast_segment,
+                now=pd.Timestamp.now(),
             )
-        result = commit_runs(
-            planned,
-            self._manifest,
-            self._backend.write_forecast_segment,
-            now=pd.Timestamp.now(),
-        )
+            # swap only after the durable save succeeded; a failed commit
+            # leaves this handle's view at its pre-call state
+            self._manifest = committed
         self._refresh_summary_after_write()
         return dataclasses.replace(result, n_runs_skipped=skipped)
 
@@ -267,22 +362,25 @@ class ForecastArchive:
             value per target is simply the newest ``recorded_at``.
         """
         batch = canonicalize_actuals(frame, mapping, source, recorded_at, official)
-        # Enforce the (series, target, source, recorded_at) identity against
-        # the existing log: exact replays collapse, differing values raise —
-        # both before anything is appended.
-        new_rows = dedup_against_log(batch, self._backend.read_actuals())
-        designations: pd.DataFrame | None = None
-        if official:
-            # Designations reference the full canonical batch: a replayed row
-            # already in the log may still need its official designation.
-            designations = check_official_registration(batch, self._backend.read_officials())
-        self._backend.append_actuals_segment(new_rows)
-        if designations is not None and not designations.empty:
-            designations = designations.copy()
-            designations["designated_at"] = pd.Timestamp.now()
-            self._backend.append_officials_segment(designations)
-        logger.info("registered %d actual(s)%s", len(new_rows), " as official" if official else "")
-        self._log_new_conflicts()
+        with self._lock():
+            # Enforce the (series, target, source, recorded_at) identity
+            # against the existing log: exact replays collapse, differing
+            # values raise — both before anything is appended.
+            new_rows = dedup_against_log(batch, self._backend.read_actuals())
+            designations: pd.DataFrame | None = None
+            if official:
+                # Designations reference the full canonical batch: a replayed
+                # row already in the log may still need its designation.
+                designations = check_official_registration(batch, self._backend.read_officials())
+            self._backend.append_actuals_segment(new_rows)
+            if designations is not None and not designations.empty:
+                designations = designations.copy()
+                designations["designated_at"] = pd.Timestamp.now()
+                self._backend.append_officials_segment(designations)
+            logger.info(
+                "registered %d actual(s)%s", len(new_rows), " as official" if official else ""
+            )
+            self._log_new_conflicts()
         self._refresh_summary_after_write()
 
     def mark_official(
@@ -300,18 +398,19 @@ class ForecastArchive:
         already be registered; identify it by ``series``/``target`` plus, when
         several revisions exist, ``source`` and/or ``recorded_at``.
         """
-        actuals = self._backend.read_actuals()
-        row = find_actual_row(actuals, series, target, source, recorded_at)
-        designation = pd.DataFrame(
-            {
-                "series_id": [row["series_id"]],
-                "target": [row["target"]],
-                "source": [row["source"]],
-                "actual_recorded_at": [row["actual_recorded_at"]],
-                "designated_at": [pd.Timestamp.now()],
-            }
-        )
-        self._backend.append_officials_segment(designation)
+        with self._lock():
+            actuals = self._backend.read_actuals()
+            row = find_actual_row(actuals, series, target, source, recorded_at)
+            designation = pd.DataFrame(
+                {
+                    "series_id": [row["series_id"]],
+                    "target": [row["target"]],
+                    "source": [row["source"]],
+                    "actual_recorded_at": [row["actual_recorded_at"]],
+                    "designated_at": [pd.Timestamp.now()],
+                }
+            )
+            self._backend.append_officials_segment(designation)
         logger.info("official designation recorded")
         self._refresh_summary_after_write()
 
@@ -320,11 +419,12 @@ class ForecastArchive:
         last-write-wins; comparison metadata only, not a registry)."""
         if not model_id or not model_version:
             raise ValidationError("set_champion requires a model_id and model_version")
-        champions = self.champions()
-        champions[model_id] = model_version
-        tmp = self._champions_path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(champions, indent=1), encoding="utf-8")
-        os.replace(tmp, self._champions_path)
+        with self._lock():
+            champions = self.champions()  # re-read inside the lock: merge, not clobber
+            champions[model_id] = model_version
+            tmp = self._champions_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(champions, indent=1), encoding="utf-8")
+            os.replace(tmp, self._champions_path)
         logger.info("champion updated")
 
     def champions(self) -> dict[str, str]:
@@ -365,8 +465,8 @@ class ForecastArchive:
             digest.update(f"run:{run_id}\n".encode())
         for component in sorted(self._backend.raw_state_components()):
             digest.update(f"{component}\n".encode())
-        for name in sorted(self._registry.names(summarizable_only=True)):
-            digest.update(f"metric:{name}\n".encode())
+        for component in sorted(self._registry.token_components()):
+            digest.update(f"{component}\n".encode())
         return digest.hexdigest()
 
     def _valid_summary(self) -> pd.DataFrame | None:

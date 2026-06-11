@@ -1,10 +1,13 @@
-"""Store lifecycle: format-version gate, refusal to re-initialize, persistence."""
+"""Store lifecycle: format-version gate, refusal to re-initialize, persistence,
+and migration of legacy manifests."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
+import pandas as pd
 import pytest
 from tests.conftest import actuals_frame, forecast_frame
 
@@ -56,3 +59,70 @@ def test_archive_persists_across_reopen(store: Path) -> None:
 def test_unknown_backend_is_refused(store: Path) -> None:
     with pytest.raises(ValidationError, match="snowflake"):
         ForecastArchive(store, backend="bigquery")
+
+
+def _write_legacy_store(store: Path) -> int:
+    """Hand-build a pre-57930cc store: one run record per origin batch with a
+    series_key hash and a single run_id shared by every series in the segment."""
+    ForecastArchive(store)  # lay down format-1 metadata and directories
+    frame = forecast_frame(1.0)
+    frame["model_id"] = "alpha"
+    frame["model_version"] = "v1"
+    frame["horizon"] = (frame["target"] - frame["origin"]).dt.days
+
+    records = []
+    for origin, group in frame.groupby("origin"):
+        run_id = f"legacy{origin.strftime('%Y%m%d')}"
+        tagged = group.copy()
+        tagged["run_id"] = run_id
+        tagged["ingested_at"] = pd.Timestamp("2026-06-01")
+        tagged.to_parquet(store / "forecasts" / f"{run_id}.parquet", index=False)
+        series_key = hashlib.sha256(
+            "\x1f".join(sorted(group["series_id"].unique())).encode()
+        ).hexdigest()
+        records.append(
+            {
+                "run_id": run_id,
+                "model_id": "alpha",
+                "model_version": "v1",
+                "origin": origin.isoformat(),
+                "series_key": series_key,
+                "content_hash": "legacy",
+                "segment": f"forecasts/{run_id}.parquet",
+                "ingested_at": "2026-06-01T00:00:00",
+                "superseded": False,
+            }
+        )
+    (store / "runs.json").write_text(json.dumps({"runs": records}), encoding="utf-8")
+    return len(frame)
+
+
+def test_legacy_series_set_manifest_is_migrated(store: Path) -> None:
+    """A pre-57930cc archive (per series-set run records) opens cleanly: the
+    manifest migrates to per-series records with no data loss and the store
+    behaves like a modern archive afterwards."""
+    n_rows = _write_legacy_store(store)
+
+    archive = ForecastArchive(store)
+    rows = archive.as_of("2100-01-01")
+    assert len(rows) == n_rows
+    assert not rows.duplicated(
+        subset=["model_id", "model_version", "series_id", "origin", "target"]
+    ).any()
+
+    # migrated records are per-series: replaying the same data is a no-op
+    replay = archive.ingest(forecast_frame(1.0), model_id="alpha", model_version="v1")
+    assert replay.n_runs_written == 0
+    archive.register_actuals(actuals_frame())
+    archive.reconcile()
+
+    # reopening does not re-migrate and loses nothing
+    reopened = ForecastArchive(store)
+    assert len(reopened.as_of("2100-01-01")) == n_rows
+
+
+def test_unrecognized_manifest_shape_is_a_typed_error(store: Path) -> None:
+    ForecastArchive(store)
+    (store / "runs.json").write_text('{"runs": [{"unknown_field": 1}]}', encoding="utf-8")
+    with pytest.raises(StoreFormatError):
+        ForecastArchive(store)
