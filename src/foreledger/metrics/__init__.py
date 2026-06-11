@@ -22,6 +22,7 @@ per series/period for the textbook reading.
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import uuid
 from collections.abc import Callable
@@ -36,7 +37,9 @@ logger = logging.getLogger("foreledger.metrics")
 
 FloatArray = npt.NDArray[np.float64]
 
-#: The metric protocol: aligned (forecast, actual) arrays -> float.
+#: The metric protocol: aligned (forecast, actual) arrays -> float. A
+#: non-finite return (NaN/inf) means "undefined on this data" and yields an
+#: insufficient cell rather than a stored number.
 MetricFn = Callable[[FloatArray, FloatArray], float]
 
 #: Wall-clock budget for one registered-metric evaluation.
@@ -168,12 +171,20 @@ class MetricRegistry:
         actual: FloatArray,
         series_codes: FloatArray | None = None,
     ) -> float | None:
-        """Evaluate a metric over aligned arrays.
+        """Evaluate a metric over aligned arrays; ``None`` means "no value".
 
-        Built-ins run inline. Registered user metrics run behind an
-        error/timeout guard: a raising metric yields ``None`` (the cell is
-        skipped); one that exceeds the timeout is skipped *and quarantined*
-        for the rest of the session so a hung cell cannot multiply.
+        A non-finite return (NaN/inf) is normalized to ``None`` for built-ins
+        and registered metrics alike: it is the in-protocol way to say the
+        metric is undefined on this data (MAPE with all-zero actuals, MASE
+        with a flat naive denominator), so the cell reads as insufficient and
+        non-finite numbers never reach the stored summary. It is not treated
+        as a defect — no quarantine — because one degenerate scope must not
+        disable a metric that is valid everywhere else.
+
+        Registered user metrics additionally run behind an error/timeout
+        guard: a raising metric yields ``None`` (the cell is skipped); one
+        that exceeds the timeout is skipped *and quarantined* for the rest of
+        the session so a hung cell cannot multiply.
 
         This is failure containment, not a security sandbox: registered code
         runs in-process with the caller's privileges, and a hung metric's
@@ -189,7 +200,8 @@ class MetricRegistry:
         if metric.builtin and name == "MASE":
             fn = make_mase(series_codes)
         if metric.builtin:
-            return fn(forecast, actual)
+            value = fn(forecast, actual)
+            return value if math.isfinite(value) else None
 
         outcome: list[float] = []
         failure: list[BaseException] = []
@@ -213,4 +225,6 @@ class MetricRegistry:
         if failure:
             logger.warning("registered metric raised; cell skipped", exc_info=failure[0])
             return None
-        return outcome[0] if outcome else None
+        if not outcome or not math.isfinite(outcome[0]):
+            return None
+        return outcome[0]

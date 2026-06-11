@@ -125,6 +125,34 @@ def test_bad_registered_metric_cannot_corrupt_recompute(populated: ForecastArchi
     assert broken_result.status == "insufficient"
 
 
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_metric_result_yields_insufficient_not_stored(
+    populated: ForecastArchive, bad: float
+) -> None:
+    """A non-finite return is the in-protocol "undefined on this data"
+    signal: the cell reads as insufficient, no non-finite number is ever
+    persisted in the summary, and the metric is NOT quarantined — it stays
+    usable for scopes where it is defined."""
+
+    def sometimes_undefined(forecast: FloatArray, actual: FloatArray) -> float:
+        return bad
+
+    populated.register_metric("Undef", sometimes_undefined, summarizable=True)
+    result = populated.accuracy_at_horizon(1, metric="Undef", model_id="alpha", model_version="v1")
+    assert result.status == "insufficient"
+    assert result.value is None
+    # the rebuilt summary holds finite values only
+    populated.rebuild_summary()
+    stored = populated._backend.read_summary()
+    assert stored is not None
+    assert np.isfinite(stored[0]["value"].to_numpy(dtype="float64")).all()
+    # not quarantined: a now-finite re-registration evaluates normally
+    populated.register_metric("Undef", lambda f, a: 1.0, summarizable=True)
+    healthy = populated.accuracy_at_horizon(1, metric="Undef", model_id="alpha", model_version="v1")
+    assert healthy.status == "ok"
+    populated.reconcile()
+
+
 def test_hanging_registered_metric_times_out_and_is_quarantined(tmp_path: object) -> None:
     from pathlib import Path
 
