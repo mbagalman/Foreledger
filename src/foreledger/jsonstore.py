@@ -18,8 +18,9 @@ from typing import Any
 def atomic_write_json(path: Path, payload: Any, indent: int | None = 1) -> None:
     """Write ``payload`` as JSON via temp-file + atomic rename.
 
-    ``path`` must end in ``.json``; the temp file is ``<path>.tmp`` (i.e.
-    ``*.json.tmp``), which the store-initialization plumbing knows to ignore.
+    ``path`` must end in ``.json``; the temp file lands beside it as
+    ``<name>.json.tmp``. A reader can therefore never observe a partial
+    file — it sees the old content or the new, nothing in between.
     """
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(payload, indent=indent), encoding="utf-8")

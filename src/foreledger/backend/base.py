@@ -3,8 +3,8 @@
 The seam exposes scans/filters over the canonical schema in engine-neutral,
 dialect-parameterized terms. Predicates are built here as ANSI SQL with
 positional placeholders; a concrete backend supplies the physical table
-expressions and execution. Consumers (ingestion, actuals, summary, eval)
-never see the engine or its SQL dialect.
+expressions and execution. Consumers (the archive facade, lifecycle
+migrations, summary, query) never see the engine or its SQL dialect.
 """
 
 from __future__ import annotations

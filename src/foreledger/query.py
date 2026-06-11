@@ -124,6 +124,8 @@ class Evaluator:
     # -- snapshot plumbing ---------------------------------------------------
 
     def _snapshot(self) -> _QuerySnapshot:
+        """One snapshot per public call: verify integrity, then capture the
+        visibility pair. Everything else on the snapshot loads lazily."""
         self._integrity_check()
         run_ids, segments = self._forecast_visibility()
         return _QuerySnapshot(run_ids=run_ids, segments=segments)
@@ -219,6 +221,11 @@ class Evaluator:
         series: str | Sequence[str] | None,
         period: Period,
     ) -> AccuracyResult:
+        """Compute one accuracy point from raw rows (the fallback path).
+
+        Forecasts without a matching actual are counted, never dropped
+        silently: they downgrade the status via ``n_missing_actuals``.
+        """
         forecasts = self._read_forecasts(
             snap,
             horizon=horizon,
@@ -259,6 +266,8 @@ class Evaluator:
         model_version: str,
         series_cell: str,
     ) -> AccuracyResult | None:
+        """Serve one exact summary cell, or None when the request does not
+        match a stored cell (the caller then falls back to raw)."""
         stored = self._summary(snap)
         if stored is None or stored.empty:
             return None
@@ -301,6 +310,10 @@ class Evaluator:
         series: str | Sequence[str] | None,
         period: Period,
     ) -> AccuracyResult:
+        """Route one accuracy request: the summary serves it only when the
+        scope matches a precomputed cell exactly (no fallback, no period,
+        single model/version, single-or-all series); anything else — and any
+        summary miss — computes from raw, invisibly."""
         self._registry.get(metric)  # raises UnknownMetricError early
         summary_servable = (
             fallback is None
@@ -343,6 +356,7 @@ class Evaluator:
         series: str | Sequence[str] | None = None,
         period: Period = None,
     ) -> list[int]:
+        """The sorted distinct horizons present in the scoped forecasts."""
         forecasts = self._read_forecasts(
             snap, model_id=model_id, model_version=model_version, series=series, period=period
         )
@@ -361,6 +375,8 @@ class Evaluator:
         series: str | Sequence[str] | None,
         period: Period,
     ) -> list[dict[str, Any]]:
+        """Comparison rows for the listed models at one horizon, sharing the
+        caller's snapshot; each champion is evaluated at most once."""
         champion_results: dict[str, AccuracyResult] = {}
 
         def scoped(mid: str, mv: str) -> AccuracyResult:
@@ -429,6 +445,8 @@ class Evaluator:
         series: str | Sequence[str] | None = None,
         period: Period = None,
     ) -> AccuracyResult:
+        """One accuracy point at horizon ``h`` (full parameter semantics on
+        :meth:`ForecastArchive.accuracy_at_horizon`, which delegates here)."""
         return self._accuracy(
             self._snapshot(),
             h,
@@ -449,6 +467,7 @@ class Evaluator:
         series: str | Sequence[str] | None = None,
         period: Period = None,
     ) -> list[int]:
+        """The sorted distinct horizons present in the scoped forecasts."""
         return self._horizons(
             self._snapshot(),
             model_id=model_id,
@@ -468,6 +487,8 @@ class Evaluator:
         series: str | Sequence[str] | None = None,
         period: Period = None,
     ) -> AccuracyCurve:
+        """One point per horizon over a single shared snapshot; each point
+        equals the corresponding standalone :meth:`accuracy_at_horizon`."""
         snap = self._snapshot()
         if horizons is None:
             horizons = self._horizons(

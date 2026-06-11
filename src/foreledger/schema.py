@@ -96,7 +96,7 @@ def compute_horizon(origin: pd.Series, target: pd.Series) -> pd.Series:
     if (days % 1 != 0).any():
         raise ValidationError(
             "target - origin must be a whole number of days for every row "
-            "(sub-daily horizons are not supported in format version 1)"
+            "(sub-daily horizons are out of scope for v1)"
         )
     return days.astype("int64")
 

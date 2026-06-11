@@ -66,6 +66,8 @@ def foreign_entries(store: Path) -> bool:
 
 
 def refuse_non_archive_dir(store: Path) -> None:
+    """Refuse to treat an existing non-archive directory as a store — the
+    library never silently initializes over a user's contents."""
     if not store.exists():
         return
     if not store.is_dir():
@@ -78,6 +80,11 @@ def refuse_non_archive_dir(store: Path) -> None:
 
 
 def stored_format_version(store: Path) -> int | None:
+    """The declared format version, or None for a store with no metadata yet.
+
+    Strictly an integer: corrupt metadata or a non-integer version (bool,
+    float, string) raises :class:`StoreFormatError` — the gate never guesses.
+    """
     meta_path = store / META_FILE
     if not meta_path.exists():
         return None
@@ -96,6 +103,8 @@ def stored_format_version(store: Path) -> int | None:
 
 
 def write_format_version(store: Path, version: int) -> None:
+    """Stamp the format version into the store metadata (atomically),
+    preserving other fields; first write also stamps ``created_at``."""
     meta_path = store / META_FILE
     payload: dict[str, Any] = {"format_version": version}
     if meta_path.exists():

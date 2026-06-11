@@ -15,8 +15,9 @@ class ForecastArchiveError(Exception):
 class StoreFormatError(ForecastArchiveError):
     """The store is corrupt, incompatible, or written by a newer format version.
 
-    Raised on open; the archive never silently re-initializes an existing
-    directory (that would discard history).
+    Raised at open (the archive never silently re-initializes an existing
+    directory — that would discard history) and from any later read or write
+    whose integrity probe finds committed data deleted or modified externally.
     """
 
 

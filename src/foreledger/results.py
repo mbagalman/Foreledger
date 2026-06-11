@@ -1,8 +1,10 @@
 """Typed result objects returned by the evaluation API.
 
-A missing-actuals outcome is an explicit ``status == "insufficient"`` result
-with the covered sample count — never a silent zero/NaN that reads as perfect
-accuracy.
+Coverage shortfalls are always explicit (three-state status, ADR-007
+amendment 2026-06-11): a scope with unscored forecasts is ``"partial"`` with
+the gap counted in ``n_missing_actuals``, and a scope where nothing could be
+scored is ``"insufficient"`` with ``value=None`` — never a silent zero/NaN
+that reads as perfect accuracy.
 """
 
 from __future__ import annotations

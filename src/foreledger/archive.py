@@ -5,8 +5,12 @@ dialect-aware seam), push forecast runs and actuals into it, and ask the
 questions the archive exists to answer: accuracy by horizon, model-vs-model
 comparison, and what-did-we-know-when (``as_of``) slices.
 
-Everything observable goes through this class; the modules behind it
-(ingestion, actuals, summary, query, backend) are implementation layers.
+Everything observable goes through this class; the modules behind it are
+implementation layers — ``lifecycle`` (format gate, initialization,
+migrations), ``ingestion``/``actuals`` (write-side canonicalization and
+identity), ``integrity`` (committed-segment fingerprints and the commit
+journal), ``summary``/``query`` (the read side), and ``backend`` (the
+engine seam).
 """
 
 from __future__ import annotations
@@ -58,8 +62,6 @@ from .schema import FORMAT_VERSION
 from .summary import build_summary
 
 logger = logging.getLogger("foreledger")
-
-_META_FILE = "archive_meta.json"
 
 
 class ForecastArchive:
@@ -592,6 +594,10 @@ class ForecastArchive:
             digest.update(f"integrity:{token}:{registry.entries[token]['sha256']}\n".encode())
         return digest.hexdigest()
 
+    # -- visibility & integrity ----------------------------------------------
+    # (journal operations — record/mark/reconcile — live in foreledger.integrity;
+    # the delegates below bind this store's registry path and backend)
+
     def _forecast_visibility(self) -> tuple[list[str], list[str]]:
         """Active (run_ids, segment tokens) from ONE manifest snapshot.
 
@@ -693,6 +699,8 @@ class ForecastArchive:
                 "externally"
             )
 
+    # -- summary validity & reconciliation -----------------------------------
+
     def _valid_summary(self) -> pd.DataFrame | None:
         """The stored summary, only if it matches the current raw state."""
         self._verify_committed_segments()
@@ -771,6 +779,8 @@ class ForecastArchive:
                 f"stored summary ({len(stored_sorted)} cells) does not equal the raw "
                 f"recomputation ({len(recomputed_sorted)} cells)"
             )
+
+    # -- conflict audit -------------------------------------------------------
 
     def _pending_conflicts(self, actuals: pd.DataFrame) -> list[Conflict]:
         """Unresolved same-timestamp conflicts not yet in the audit log."""
