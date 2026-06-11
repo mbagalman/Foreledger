@@ -1,62 +1,134 @@
-# Foreledger — Production Forecast Archive
+# Foreledger
 
-A Python library that ingests recurring forecast runs from multiple models and
-versions (including parallel runs), stores them as a durable append-only
-Parquet archive alongside a revisable actuals log, and answers:
+**A durable ledger for your forecasts — so you can finally answer "how accurate are we, really?"**
 
-- **Horizon-keyed accuracy** — on a `latest` or `official` actuals basis
-- **Cross-model / cross-version comparison** — optionally vs. a champion
-- **Bitemporal `as_of` queries** — what did we know, when?
+## The problem
 
-All storage and query goes through a dialect-aware backend seam: DuckDB over
-Parquet in v1, with warehouse-native backends (Snowflake) as a v1.1
-fast-follow.
+Every team that forecasts — demand, revenue, staffing, inventory — produces
+predictions on a schedule, acts on them, and then quietly throws them away.
+Next week brings a new forecast, and the old one is overwritten in a
+spreadsheet, buried in a model artifact, or simply gone.
 
-> **Status:** working MVP (Phases 1–4 of the
-> [implementation plan](docs/implementation-plan-forecast-archive.md)): ingestion
-> with atomic, idempotent runs; the revisable actuals log with official
-> designations; built-in + registerable metrics; the eager, rebuildable accuracy
-> summary; and the full evaluation/comparison/`as_of` query surface. Packaging
-> and release (Phase 5) and the Snowflake backend (Phase 6, v1.1) remain.
+That makes the questions leadership actually asks surprisingly hard to answer
+honestly:
 
-## Quickstart
+- *"How far out can we trust the forecast?"* Nobody stored what was predicted
+  14 days ahead vs. 2 days ahead, so nobody knows where accuracy falls off.
+- *"Is the new model actually better?"* The data scientist's backtest says
+  yes, but there's no like-for-like record of what each model predicted in
+  production.
+- *"Why did we order so much stock in March?"* The forecast that drove the
+  decision no longer exists — only the embarrassing outcome does.
+
+And there's a subtler trap: **the truth itself changes.** Actuals get
+restated — a late data feed, a returns adjustment, a finance correction. If
+you score yesterday's forecast against today's revised numbers without
+keeping track, your accuracy reports quietly stop meaning anything.
+
+## What Foreledger does
+
+Foreledger treats forecasts the way accounting treats money: **every entry is
+recorded, nothing is erased, and the books always reconcile.**
+
+You push each forecast run into the ledger as it happens (one line of code in
+your existing pipeline), register actuals as they arrive — including
+revisions and an optional "official" designation for the numbers finance
+signed off on — and Foreledger answers, instantly and reproducibly:
+
+1. **Accuracy by horizon** — a curve showing exactly how error grows the
+   further out you predict, for any model, series, or time window.
+2. **Model vs. model** — fair, same-data comparisons across models and
+   versions, with deltas against your designated champion.
+3. **What did we know when** — replay the forecast exactly as it stood on any
+   past date, with no hindsight leaking in. The forecast that drove the March
+   decision is one query away.
+
+When the data can't support an honest answer — actuals missing, sources
+conflicting — Foreledger says *"insufficient data"* out loud rather than
+serving a number that looks like perfect accuracy.
+
+## Quick start
 
 ```bash
-pip install -e .
-python examples/quickstart.py   # synthetic fixture -> accuracy-vs-horizon curves
+pip install -e .            # PyPI release coming with v0.1
+python examples/quickstart.py   # full demo on synthetic data, zero config
 ```
 
 ```python
-from forecast_archive import ForecastArchive
+from foreledger import ForecastArchive
 
-archive = ForecastArchive("./my_archive")
-archive.ingest(forecasts_df, model_id="prophet", model_version="2.1")
+archive = ForecastArchive("./forecast_ledger")
+
+# after every forecast run:
+archive.ingest(predictions_df, model_id="prophet", model_version="2.1")
+
+# as actuals arrive (revisions welcome):
 archive.register_actuals(actuals_df, source="warehouse")
+
+# the payoff:
 curve = archive.accuracy_curve(metric="MAE", model_id="prophet", model_version="2.1")
 print(curve.to_frame())
 ```
 
-## Development
+**[Read the full quick-start guide →](docs/quickstart.md)**
 
-Requires Python ≥ 3.11.
+## Key capabilities
+
+- **Append-only forecast archive** keyed on
+  `(model, version, series, run date, target date)` — parallel model versions
+  coexist; ingestion is atomic and idempotent, so crashed or replayed
+  pipelines can't corrupt or duplicate history.
+- **Revisable actuals log** — every restatement is kept; accuracy can be
+  scored against the *latest* numbers or only the *official* ones, and
+  same-timestamp conflicts between feeds are resolved by your priority rules
+  or flagged loudly, never picked silently.
+- **Built-in metrics** (MAE, RMSE, MAPE, MASE) plus a protocol for
+  registering your own — custom metrics run sandboxed so a buggy one can't
+  corrupt the archive.
+- **Champion/challenger workflow** — designate a champion per model and every
+  comparison reports challenger deltas automatically.
+- **Drill-down provenance** — any headline accuracy number can be exploded
+  into the exact forecast/actual pairs behind it, and they reconcile exactly.
+- **Local-first, warehouse-ready** — v1 stores Parquet on your disk via
+  DuckDB (your data never leaves your machine); the storage layer is built
+  behind a dialect-aware seam so a Snowflake backend (v1.1) drops in without
+  changing your code.
+
+## How it works (the technical bit)
+
+Foreledger is a small, layered Python library (≥ 3.11):
+
+- **Raw archive** — append-only Parquet, the permanent source of truth, with
+  an on-disk format version gate. Visibility is committed via a run manifest,
+  which is what makes ingestion all-or-nothing.
+- **Actuals log** — model-independent, append-only revisions keyed
+  `(series, target, source, recorded_at)`, with sticky official designations.
+- **Accuracy summary** — a precomputed, *disposable* cache rebuilt eagerly on
+  every write. Queries route to it invisibly and fall back to raw
+  computation; both paths share one code path and a `reconcile()` check
+  asserts they agree exactly.
+- **Backend seam** — all storage and query runs through an engine-neutral,
+  dialect-parameterized layer; a CI guard (AST scan) ensures no DuckDB-only
+  code leaks out of the backend module.
+
+Architecture and the decisions behind it are documented in
+[docs/](docs/): the [tech spec](docs/tech-spec-forecast-archive-final.md),
+ADRs 001–007, and the [implementation plan](docs/implementation-plan-forecast-archive.md).
+Contributor ground rules live in [AGENTS.md](AGENTS.md).
+
+## Development
 
 ```bash
 pip install -e ".[dev]"
-pytest                 # test suite
-ruff check .           # lint
-ruff format .          # format
-mypy src               # type check
-python -m build        # build artifact
+pytest                 # 60 tests incl. atomicity, reconciliation, no-leakage
+ruff check . && ruff format --check .
+mypy src               # strict
 python examples/quickstart.py
 ```
 
-## Documentation
+## Status & roadmap
 
-- Agent / contributor ground rules: [AGENTS.md](AGENTS.md)
-- Architecture and data model: [docs/tech-spec-forecast-archive-final.md](docs/tech-spec-forecast-archive-final.md)
-- Decisions and rationale: ADR-001…ADR-007 in [docs/](docs/)
-- Phased plan, risks, rollout: [docs/implementation-plan-forecast-archive.md](docs/implementation-plan-forecast-archive.md)
-- Product requirements: [docs/prd-forecast-archive.md](docs/prd-forecast-archive.md)
-
-> Note: the PyPI distribution name (`forecast-archive` is a placeholder) is an
-> open question to resolve before the first release tag.
+Working MVP (Phases 1–4 of the [plan](docs/implementation-plan-forecast-archive.md)):
+the full ingestion → actuals → evaluation surface described above, gated by CI.
+Next: packaging and PyPI release (Phase 5), then the Snowflake warehouse
+backend as v1.1 (Phase 6).

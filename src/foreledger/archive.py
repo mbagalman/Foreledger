@@ -1,8 +1,12 @@
-"""The public ``ForecastArchive`` facade.
+"""The public ``ForecastArchive`` facade — Foreledger's one entry point.
 
-Open/create an archive at a local path (v1, DuckDB-over-Parquet behind the
-dialect-aware seam), ingest forecast runs and actuals, and query horizon-keyed
-accuracy, comparisons, and ``as_of`` slices.
+Open or create an archive at a local path (v1: DuckDB-over-Parquet behind the
+dialect-aware seam), push forecast runs and actuals into it, and ask the
+questions the archive exists to answer: accuracy by horizon, model-vs-model
+comparison, and what-did-we-know-when (``as_of``) slices.
+
+Everything observable goes through this class; the modules behind it
+(ingestion, actuals, summary, query, backend) are implementation layers.
 """
 
 from __future__ import annotations
@@ -33,7 +37,7 @@ from .results import AccuracyCurve, AccuracyResult
 from .schema import FORMAT_VERSION
 from .summary import build_summary
 
-logger = logging.getLogger("forecast_archive")
+logger = logging.getLogger("foreledger")
 
 _META_FILE = "archive_meta.json"
 
@@ -55,6 +59,16 @@ class ForecastArchive:
     error_log:
         Destination file for unresolved-conflict errors; defaults to
         ``<store>/error_log.txt``.
+    metric_timeout:
+        Wall-clock budget (seconds) for one registered-metric evaluation;
+        built-in metrics are not subject to it.
+
+    Example
+    -------
+    >>> archive = ForecastArchive("./my_archive")
+    >>> archive.ingest(runs_df, model_id="prophet", model_version="2.1")
+    >>> archive.register_actuals(actuals_df, source="warehouse")
+    >>> archive.accuracy_curve(metric="MAE", model_id="prophet", model_version="2.1")
     """
 
     def __init__(
@@ -108,7 +122,7 @@ class ForecastArchive:
             if stored_version > FORMAT_VERSION:
                 raise StoreFormatError(
                     f"archive format version {stored_version} is newer than this "
-                    f"library supports ({FORMAT_VERSION}); upgrade forecast-archive "
+                    f"library supports ({FORMAT_VERSION}); upgrade foreledger "
                     "to open this store"
                 )
             return
@@ -133,12 +147,36 @@ class ForecastArchive:
         origin: Any | None = None,
         on_conflict: str = "error",
     ) -> IngestResult:
-        """Atomically append one or more runs (one per distinct origin).
+        """Atomically append one or more forecast runs (one per distinct origin).
 
-        Re-ingesting the same ``(model_id, model_version, origin, series)``
-        identity with the same values is a no-op; with different values it
-        follows ``on_conflict`` (``"error"`` or ``"overwrite"``). A different
-        model/version adds rows, never overwrites.
+        Parameters
+        ----------
+        frame:
+            Forecast rows. Must provide (directly or via ``mapping``) the
+            columns ``series_id``, ``target``, ``value``, and — unless the
+            scalar ``origin`` argument is given — ``origin``.
+        mapping:
+            Optional ``{canonical_name: your_column_name}`` translation, e.g.
+            ``{"series_id": "sku", "value": "yhat"}``.
+        model_id, model_version:
+            Caller-supplied run identity (opaque strings; never inferred,
+            ordered, or validated as semver/dates).
+        origin:
+            Scalar run date for single-run frames that carry no origin column.
+        on_conflict:
+            What to do when the same identity already exists with *different*
+            values: ``"error"`` (default) raises; ``"overwrite"`` supersedes
+            the prior run explicitly. Never a silent merge.
+
+        Returns
+        -------
+        IngestResult with rows written, runs written/skipped/superseded.
+
+        Notes
+        -----
+        The append is all-or-nothing: a failure mid-call leaves the archive at
+        its pre-call state. Re-ingesting identical data is a no-op, and a
+        different model/version always adds rows — parallel versions coexist.
         """
         canonical = canonicalize_forecasts(frame, mapping, model_id, model_version, origin)
         planned, skipped = plan_runs(canonical, self._manifest, on_conflict)
@@ -199,9 +237,29 @@ class ForecastArchive:
         official: bool = False,
         recorded_at: Any | None = None,
     ) -> None:
-        """Append a batch of actuals as a revision (append-only, never an
-        overwrite); ``official=True`` additionally designates the rows official
-        (sticky; conflicts raise before anything is written)."""
+        """Append a batch of actuals as a revision of the model-independent log.
+
+        Parameters
+        ----------
+        frame:
+            Actual observations with ``series_id``, ``target``, ``value``
+            columns (renameable via ``mapping``).
+        mapping:
+            Optional ``{canonical_name: your_column_name}`` translation.
+        source:
+            Feed label distinguishing providers/revisions registered at the
+            same instant; defaults to a single shared label.
+        official:
+            Also designate these rows as the official actuals for their
+            targets. The designation is sticky: if a *different* official
+            already exists for any target, the whole call raises
+            :class:`OfficialConflictError` before anything is written — use
+            :meth:`mark_official` to change a designation explicitly.
+        recorded_at:
+            Knowledge timestamp for the batch; defaults to now. Earlier
+            registrations are never overwritten — the effective ``latest``
+            value per target is simply the newest ``recorded_at``.
+        """
         batch = canonicalize_actuals(frame, mapping, source, recorded_at, official)
         designations: pd.DataFrame | None = None
         if official:
@@ -223,8 +281,13 @@ class ForecastArchive:
         source: str | None = None,
         recorded_at: Any | None = None,
     ) -> None:
-        """Explicitly designate which registered actual is official for a
-        target (at most one per (series, target); last designation wins)."""
+        """Explicitly designate which registered actual is official for a target.
+
+        This is the only way to *change* an official designation (at most one
+        per ``(series, target)``; the latest designation wins). The actual must
+        already be registered; identify it by ``series``/``target`` plus, when
+        several revisions exist, ``source`` and/or ``recorded_at``.
+        """
         actuals = self._backend.read_actuals()
         row = find_actual_row(actuals, series, target, source, recorded_at)
         designation = pd.DataFrame(
@@ -357,8 +420,32 @@ class ForecastArchive:
         series: str | Sequence[str] | None = None,
         period: Period = None,
     ) -> AccuracyResult:
-        """The metric at horizon ``h`` for the scope; explicit insufficient
-        result when actuals are missing, never a silent zero."""
+        """The accuracy metric at horizon ``h`` (days ahead) for a scope.
+
+        Parameters
+        ----------
+        h:
+            Horizon in days (``target - origin``).
+        metric:
+            A built-in (``MAE``/``RMSE``/``MAPE``/``MASE``) or registered name.
+        basis:
+            Which actuals to score against: ``"latest"`` (default, newest
+            revision per target) or ``"official"`` (only explicitly designated
+            values).
+        fallback:
+            With ``basis="official"`` only: ``"latest"`` fills targets that
+            lack an official actual from the latest value — the result flags
+            how many were filled. Without it such targets count as missing.
+        model_id, model_version, series, period:
+            Optional scope. Unscoped over model/version aggregates across all
+            models; ``period`` is a ``(start, end)`` window on the run date.
+
+        Returns
+        -------
+        AccuracyResult — value and sample count when computable, or an
+        explicit ``status="insufficient"`` with the missing-actuals count.
+        Missing actuals never read as a silent zero/NaN.
+        """
         return self._evaluator.accuracy_at_horizon(
             h,
             metric=metric,
@@ -381,7 +468,13 @@ class ForecastArchive:
         series: str | Sequence[str] | None = None,
         period: Period = None,
     ) -> AccuracyCurve:
-        """Accuracy vs. horizon; each point equals ``accuracy_at_horizon``."""
+        """Accuracy vs. horizon as an :class:`AccuracyCurve`.
+
+        One point per horizon (all horizons in scope when ``horizons`` is
+        omitted); each point equals the corresponding
+        :meth:`accuracy_at_horizon` call. The curve object offers
+        ``to_frame()`` and, with matplotlib installed, ``plot()``.
+        """
         return self._evaluator.accuracy_curve(
             metric=metric,
             basis=basis,
@@ -404,7 +497,17 @@ class ForecastArchive:
         series: str | Sequence[str] | None = None,
         period: Period = None,
     ) -> pd.DataFrame:
-        """Compare listed (model_id, model_version) pairs at one horizon."""
+        """Compare listed ``(model_id, model_version)`` pairs at one horizon.
+
+        All pairs are evaluated over the same scope, so each row's value
+        equals the scoped single-model :meth:`accuracy_at_horizon`. For any
+        listed version whose model has a champion — persisted via
+        :meth:`set_champion` or passed via ``champion=`` — the row carries
+        ``delta_vs_champion`` (negative means better on error metrics).
+
+        Returns a DataFrame with one row per pair: value, n, status,
+        champion_version, is_champion, delta_vs_champion.
+        """
         return self._evaluator.compare_models(
             h,
             models,
@@ -427,7 +530,12 @@ class ForecastArchive:
         series: str | Sequence[str] | None = None,
         period: Period = None,
     ) -> pd.DataFrame:
-        """Accuracy-vs-horizon curves for several model/versions (long form)."""
+        """Accuracy-vs-horizon curves for several model/versions.
+
+        Long-form DataFrame: one row per (model, version, horizon), with the
+        same columns as :meth:`compare_models`. Each model's rows equal its
+        scoped :meth:`accuracy_curve`.
+        """
         return self._evaluator.compare_curve(
             models,
             metric=metric,
@@ -446,13 +554,25 @@ class ForecastArchive:
         model_version: str | None = None,
         series: str | Sequence[str] | None = None,
     ) -> pd.DataFrame:
-        """Forecasts known as of ``origin``; no leakage from later runs."""
+        """Every forecast known as of ``origin`` — what you would have seen then.
+
+        Returns the raw rows with run date ``<= origin``, optionally scoped to
+        a model/version/series. No leakage: rows from later runs can never
+        appear, which makes this safe for honest backtests and audits.
+        """
         return self._evaluator.as_of(
             origin, model_id=model_id, model_version=model_version, series=series
         )
 
     def drill(self, summary_cell: Mapping[str, Any]) -> pd.DataFrame:
-        """The raw rows behind a summary cell; they reconcile to its value."""
+        """The raw forecast/actual pairs behind one summary cell.
+
+        ``summary_cell`` needs ``model_id``, ``model_version``, and
+        ``horizon``; ``basis`` defaults to ``"latest"`` and ``series_id`` to
+        all series. Recomputing the cell's metric over the returned rows
+        reproduces the summary value exactly — the drill-down is the audit
+        trail for any headline number.
+        """
         return self._evaluator.drill(summary_cell)
 
     def list_models(self) -> pd.DataFrame:

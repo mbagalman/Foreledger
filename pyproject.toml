@@ -3,11 +3,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-# NOTE: "forecast-archive" is a placeholder distribution name; the final PyPI
-# name must be chosen before the Phase 5 tag (see docs/implementation-plan).
-name = "forecast-archive"
+name = "foreledger"
 version = "0.1.0.dev0"
-description = "Production Forecast Archive — a durable, bitemporal archive of recurring forecast runs with horizon-keyed accuracy evaluation and cross-model/version comparison."
+description = "Foreledger — a durable, bitemporal archive of recurring forecast runs with horizon-keyed accuracy evaluation and cross-model/version comparison."
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [{ name = "Michael Bagalman", email = "michael@paradoxresolution.com" }]
@@ -44,7 +42,7 @@ polars = ["polars>=1.0"]
 Repository = "https://github.com/mbagalman/Foreledger"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/forecast_archive"]
+packages = ["src/foreledger"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

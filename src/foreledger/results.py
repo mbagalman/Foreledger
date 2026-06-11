@@ -19,7 +19,30 @@ Basis = Literal["latest", "official"]
 
 @dataclass(frozen=True)
 class AccuracyResult:
-    """The metric value for one scope at one horizon, or an explicit shortfall."""
+    """The metric value for one scope at one horizon, or an explicit shortfall.
+
+    Attributes
+    ----------
+    metric, horizon, basis:
+        What was asked: the metric name, horizon in days, and actuals basis.
+    status:
+        ``"ok"`` when a finite value was computed over at least one pair;
+        ``"insufficient"`` when actuals are missing/ambiguous or the metric
+        is undefined on the data.
+    value:
+        The metric value, or ``None`` when insufficient.
+    n:
+        Number of forecast/actual pairs the value covers.
+    n_missing_actuals:
+        Forecast rows in scope that had no usable actual (includes targets
+        marked ambiguous by an unresolved same-timestamp conflict).
+    fallback_used, n_fallback:
+        Whether/how many targets were filled from the latest basis under the
+        explicit ``fallback="latest"`` opt-in (official basis only).
+    served_from:
+        ``"summary"`` (precomputed) or ``"raw"`` (computed on the fly) —
+        the two are test-guaranteed to agree; this is latency provenance.
+    """
 
     metric: str
     horizon: int

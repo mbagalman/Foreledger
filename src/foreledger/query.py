@@ -2,7 +2,7 @@
 
 Routes to the precomputed summary when the request matches a summary cell
 exactly and falls back to raw computation otherwise, invisibly; the two paths
-share :func:`forecast_archive.summary.metric_over_pairs`, so they can never
+share :func:`foreledger.summary.metric_over_pairs`, so they can never
 silently diverge.
 
 Missing actuals are an explicit insufficient result. Under

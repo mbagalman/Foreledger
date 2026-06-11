@@ -26,7 +26,7 @@ import pandas as pd
 from .errors import ValidationError
 from .schema import compute_horizon, to_timestamp
 
-logger = logging.getLogger("forecast_archive.ingestion")
+logger = logging.getLogger("foreledger.ingestion")
 
 _CANONICAL_INPUT = ("series_id", "target", "value")
 

@@ -20,7 +20,7 @@ import pandas as pd
 from .metrics import MetricRegistry
 from .schema import ALL_PERIOD, ALL_SERIES, SUMMARY_COLUMNS, empty_summary
 
-logger = logging.getLogger("forecast_archive.summary")
+logger = logging.getLogger("foreledger.summary")
 
 
 def metric_over_pairs(

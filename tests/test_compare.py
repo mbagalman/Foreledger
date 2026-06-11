@@ -6,7 +6,7 @@ import pandas as pd
 import pytest
 from tests.conftest import HORIZONS, MODELS
 
-from forecast_archive import ForecastArchive
+from foreledger import ForecastArchive
 
 ALL_MODELS = list(MODELS)
 

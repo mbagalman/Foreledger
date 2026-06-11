@@ -1,7 +1,7 @@
 """Smoke test: the package imports and reports a version."""
 
-import forecast_archive
+import foreledger
 
 
 def test_package_imports() -> None:
-    assert forecast_archive.__version__
+    assert foreledger.__version__

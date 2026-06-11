@@ -6,7 +6,13 @@
       "PowerShell(mypy src 2>&1)",
       "PowerShell(ruff check --fix . 2>&1)",
       "PowerShell(ruff format . 2>&1)",
-      "PowerShell(python examples/quickstart.py | Out-Null; \"exit=$LASTEXITCODE\")"
+      "PowerShell(python examples/quickstart.py | Out-Null; \"exit=$LASTEXITCODE\")",
+      "PowerShell(gh run list --repo mbagalman/Foreledger --limit 3 2>&1)",
+      "PowerShell(gh run watch 27343766077 --repo mbagalman/Foreledger --exit-status 2>&1)",
+      "PowerShell(gh run watch \\(gh run list --repo mbagalman/Foreledger --limit 1 --json databaseId --jq '.[0].databaseId'\\) --repo mbagalman/Foreledger --exit-status 2>&1 | Select-Object -Last 6)",
+      "PowerShell(gh run view \\(gh run list --repo mbagalman/Foreledger --limit 1 --json databaseId --jq '.[0].databaseId'\\) --repo mbagalman/Foreledger --log-failed 2>&1 | Select-String -Pattern \"FAILED|error|assert|Error\" | Select-Object -First 20)",
+      "PowerShell(gh run view \\(gh run list --repo mbagalman/Foreledger --limit 1 --json databaseId --jq '.[0].databaseId'\\) --repo mbagalman/Foreledger --log-failed 2>&1 | Select-String -Pattern \"FAILED|E  |error\" | Select-Object -First 20)",
+      "PowerShell(gh run list --repo mbagalman/Foreledger --limit 1)"
     ]
   }
 }

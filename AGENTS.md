@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Production Forecast Archive — a Python library that ingests recurring forecast runs from multiple models and versions (including parallel runs), stores them as a durable append-only Parquet archive alongside a revisable actuals log, behind a dialect-aware, warehouse-ready DuckDB backend seam, and answers horizon-keyed accuracy (on a `latest`/`official` basis), cross-model/version comparison (optionally vs. a champion), and bitemporal `as_of` queries over the user's own data.
+Foreledger (working name during design: "Production Forecast Archive") — a Python library that ingests recurring forecast runs from multiple models and versions (including parallel runs), stores them as a durable append-only Parquet archive alongside a revisable actuals log, behind a dialect-aware, warehouse-ready DuckDB backend seam, and answers horizon-keyed accuracy (on a `latest`/`official` basis), cross-model/version comparison (optionally vs. a champion), and bitemporal `as_of` queries over the user's own data.
 
 ## Tooling and versions
 
@@ -8,7 +8,7 @@ Production Forecast Archive — a Python library that ingests recurring forecast
 - DuckDB — pinned, tested range in `pyproject.toml` (the only storage/query engine in v1; Snowflake is a v1.1 fast-follow).
 - Storage format: Apache Parquet (Arrow) on local disk (v1); warehouse-native tables at v1.1.
 - DataFrame interop: pandas and/or Polars (returned by the query API).
-- Optional extras: `forecast-archive[snowflake]` (v1.1 warehouse backend; not a core dependency).
+- Optional extras: `foreledger[snowflake]` (v1.1 warehouse backend; not a core dependency).
 - Test: pytest (+ hypothesis for property tests). Lint: ruff. Types: mypy. Build: `python -m build`.
 
 ## Commands
@@ -42,7 +42,7 @@ These are project decisions that deviate from defaults — the ADRs record why; 
 Verbatim from `docs/implementation-plan-forecast-archive.md` (Agent execution boundaries).
 
 **Allowed without approval:**
-- Edit source under `src/forecast_archive/`.
+- Edit source under `src/foreledger/`.
 - Add/edit tests under `tests/`; add/update fixtures under `tests/fixtures/`.
 - Run the test suite via `pytest`; run `ruff` and `mypy`; run the formatter.
 - Build docs under `docs/`; run the local quickstart script against the synthetic fixture.

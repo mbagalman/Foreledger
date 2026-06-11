@@ -10,7 +10,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from forecast_archive import ForecastArchive
+from foreledger import ForecastArchive
 
 SENSITIVE_SERIES = "SECRET_REVENUE_SERIES"
 SENSITIVE_MODEL = "SECRET_MODEL_NAME"

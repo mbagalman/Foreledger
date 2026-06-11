@@ -6,7 +6,7 @@ import pandas as pd
 import pytest
 from tests.conftest import ORIGINS, forecast_frame
 
-from forecast_archive import ForecastArchive, IngestConflictError, ValidationError
+from foreledger import ForecastArchive, IngestConflictError, ValidationError
 
 
 def total_rows(archive: ForecastArchive) -> int:

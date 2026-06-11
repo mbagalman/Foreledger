@@ -28,7 +28,7 @@ import numpy.typing as npt
 
 from ..errors import UnknownMetricError, ValidationError
 
-logger = logging.getLogger("forecast_archive.metrics")
+logger = logging.getLogger("foreledger.metrics")
 
 FloatArray = npt.NDArray[np.float64]
 

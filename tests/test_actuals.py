@@ -8,7 +8,7 @@ import pandas as pd
 import pytest
 from tests.conftest import ORIGINS, forecast_frame
 
-from forecast_archive import ForecastArchive, OfficialConflictError
+from foreledger import ForecastArchive, OfficialConflictError
 
 
 def one_target_frame(value: float) -> pd.DataFrame:

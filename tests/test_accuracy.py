@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 from tests.conftest import HORIZONS, MODELS, ORIGINS, SERIES, reference_mae
 
-from forecast_archive import ForecastArchive
+from foreledger import ForecastArchive
 
 
 def test_accuracy_equals_handwritten_reference(populated: ForecastArchive) -> None:

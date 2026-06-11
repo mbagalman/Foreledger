@@ -7,8 +7,8 @@ import pandas as pd
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from forecast_archive.actuals import resolve_effective_latest
-from forecast_archive.metrics import mae, mape, rmse
+from foreledger.actuals import resolve_effective_latest
+from foreledger.metrics import mae, mape, rmse
 
 finite_floats = st.floats(min_value=-1e6, max_value=1e6, allow_nan=False, allow_infinity=False)
 

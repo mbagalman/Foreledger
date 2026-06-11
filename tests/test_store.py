@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from tests.conftest import actuals_frame, forecast_frame
 
-from forecast_archive import ForecastArchive, StoreFormatError, ValidationError
+from foreledger import ForecastArchive, StoreFormatError, ValidationError
 
 
 def test_newer_format_version_is_refused(store: Path) -> None:

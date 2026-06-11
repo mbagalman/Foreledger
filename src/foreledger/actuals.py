@@ -29,7 +29,7 @@ from .errors import OfficialConflictError, ValidationError
 from .ingestion import _resolve_mapping, normalize_datetimes
 from .schema import DEFAULT_SOURCE, to_timestamp
 
-logger = logging.getLogger("forecast_archive.actuals")
+logger = logging.getLogger("foreledger.actuals")
 
 _ACTUAL_INPUT = ("series_id", "target", "value")
 

@@ -1,10 +1,15 @@
-"""Typed errors for the forecast archive."""
+"""Typed errors raised by Foreledger.
+
+Every failure mode the library promises to surface loudly (format
+incompatibility, identity conflicts, summary divergence) has its own class,
+so callers can handle each without string-matching messages.
+"""
 
 from __future__ import annotations
 
 
 class ForecastArchiveError(Exception):
-    """Base class for all forecast-archive errors."""
+    """Base class for all foreledger errors."""
 
 
 class StoreFormatError(ForecastArchiveError):

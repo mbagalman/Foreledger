@@ -12,7 +12,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from forecast_archive import ForecastArchive
+from foreledger import ForecastArchive
 
 SERIES = ["S1", "S2", "S3"]
 ORIGINS = pd.date_range("2026-01-01", periods=5, freq="D")

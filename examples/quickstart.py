@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from forecast_archive import ForecastArchive
+from foreledger import ForecastArchive
 
 SERIES = [f"store_{i}" for i in range(1, 5)]
 ORIGINS = pd.date_range("2026-01-01", periods=30, freq="D")
@@ -66,7 +66,7 @@ def ascii_chart(label: str, frame: pd.DataFrame, width: int = 48) -> None:
 
 
 def main() -> None:
-    store = Path(tempfile.mkdtemp(prefix="forecast_archive_quickstart_"))
+    store = Path(tempfile.mkdtemp(prefix="foreledger_quickstart_"))
     print(f"archive store: {store}")
     archive = ForecastArchive(store)
 

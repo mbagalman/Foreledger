@@ -10,7 +10,7 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-import forecast_archive
+import foreledger
 
 ENGINE_MODULES = {"duckdb", "pyarrow"}
 ENGINE_IDIOMS = ("read_parquet", "parquet_scan", "pragma ", ".df(")
@@ -33,7 +33,7 @@ def _docstring_nodes(tree: ast.Module) -> set[int]:
 
 
 def package_modules_outside_backend() -> list[Path]:
-    package_root = Path(forecast_archive.__file__).parent
+    package_root = Path(foreledger.__file__).parent
     return [
         path
         for path in sorted(package_root.rglob("*.py"))

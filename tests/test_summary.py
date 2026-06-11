@@ -9,8 +9,8 @@ import pandas as pd
 import pytest
 from tests.conftest import actuals_frame, forecast_frame
 
-from forecast_archive import ForecastArchive, ReconciliationError, ValidationError
-from forecast_archive.metrics import FloatArray
+from foreledger import ForecastArchive, ReconciliationError, ValidationError
+from foreledger.metrics import FloatArray
 
 
 def test_reconciliation_passes_for_both_bases(populated: ForecastArchive) -> None:
