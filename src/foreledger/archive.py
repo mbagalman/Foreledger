@@ -878,19 +878,36 @@ class ForecastArchive:
             return None
         return frame
 
+    def _publish_summary(self, frame: pd.DataFrame, snapshot_token: str) -> bool:
+        """Publish a computed summary, unless the archive moved on while it
+        was being computed.
+
+        Guard and publication are one locked unit, and commits take the same
+        lock, so the current-state check cannot go stale before the replace:
+        a slow rebuild from an older snapshot can never publish over (and
+        sweep) a newer handle's generation — the writer that advanced the
+        state refreshes the summary for it. Returns whether it published.
+        """
+        with self._lock():
+            if self._state_token() != snapshot_token:
+                logger.info(
+                    "summary rebuild discarded: the archive state changed while "
+                    "it was being computed"
+                )
+                return False
+            self._backend.replace_summary(frame, snapshot_token)
+        return True
+
     def rebuild_summary(self) -> None:
         """Recompute the disposable summary from raw and store it.
 
         Computed from one evaluation snapshot (so the frame and its validity
-        token always describe the same state) and replaced under the store
-        lock (so two handles' rebuilds serialize — interleaved data/token
-        writes could otherwise pair one handle's data with the other's
-        token, and the two can legitimately differ via source priority or
-        registered metrics)."""
+        token always describe the same state) and published under the store
+        lock only if that snapshot is still the current state — see
+        :meth:`_publish_summary`."""
         snap = self._evaluation_snapshot()
         frame = self._recompute_summary_from(snap)
-        with self._lock():
-            self._backend.replace_summary(frame, snap.summary_token)
+        self._publish_summary(frame, snap.summary_token)
 
     def _refresh_summary_after_write(self) -> None:
         """Eagerly refresh the summary after a raw write, without letting a
@@ -941,9 +958,10 @@ class ForecastArchive:
                 stored = frame
         if stored is None:
             # absent or stale: rebuild rather than diagnose — it was never
-            # being served
-            with self._lock():
-                self._backend.replace_summary(recomputed, snap.summary_token)
+            # being served. Same staleness guard as rebuild_summary: if the
+            # state moved while recomputing, leave the repair to the writer
+            # that moved it.
+            self._publish_summary(recomputed, snap.summary_token)
             return
         key = [
             "actual_basis",

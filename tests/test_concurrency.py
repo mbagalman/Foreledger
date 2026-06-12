@@ -264,3 +264,53 @@ def test_reader_never_pairs_old_token_with_new_summary_data(
     # entirely the BEFORE state — never the new data blessed by the old token
     assert curve.points[0].value == 1.0
     assert curve.points[1].status == "insufficient"
+
+
+def test_stale_rebuild_cannot_erase_a_newer_summary(
+    store: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review reproduction: a slow rebuild computed from an older snapshot
+    must be discarded at publication time, not published over (and sweep)
+    the newer state's generation — otherwise two successful operations leave
+    the eager summary unavailable until the next repair."""
+    import pandas as pd
+
+    handle_a = ForecastArchive(store)
+    handle_a.ingest(forecast_frame(1.0), model_id="alpha", model_version="v1")
+    handle_a.register_actuals(actuals_frame(), recorded_at="2026-02-01")
+
+    handle_b = ForecastArchive(store)
+    revision = actuals_frame()
+    revision["value"] = revision["value"] + 1.0
+
+    # pause A's recompute after it has captured the old snapshot: B commits
+    # a revision (and eagerly publishes the new summary) in the gap
+    real_recompute = handle_a._recompute_summary_from
+    fired = {"done": False}
+
+    def slow_recompute(snap):  # type: ignore[no-untyped-def]
+        frame = real_recompute(snap)
+        if not fired["done"]:
+            fired["done"] = True
+            handle_b.register_actuals(revision, recorded_at="2026-03-01")
+        return frame
+
+    monkeypatch.setattr(handle_a, "_recompute_summary_from", slow_recompute)
+    handle_a.rebuild_summary()  # computes from the pre-revision snapshot
+    assert fired["done"]
+
+    # the stale result was discarded: the stored token matches the CURRENT
+    # state and a normal query is still eagerly summary-served
+    import json
+
+    meta = json.loads((store / "summary" / "summary_meta.json").read_text(encoding="utf-8"))
+    assert meta["state_token"] == handle_a._state_token()
+    result = handle_a.accuracy_at_horizon(1, model_id="alpha", model_version="v1")
+    assert result.served_from == "summary"
+    # and it reflects the post-revision truth
+    raw_pairs = handle_a.drill(
+        {"model_id": "alpha", "model_version": "v1", "horizon": 1, "metric": "MAE"}
+    )
+    expected = float((raw_pairs["value"] - raw_pairs["actual_value"]).abs().mean())
+    assert result.value == pd.Series([expected]).iloc[0]
+    handle_a.reconcile()
