@@ -979,8 +979,22 @@ class ForecastArchive:
                     f"committed segment {token!r} does not match its recorded "
                     "content hash; raw archive data was modified externally"
                 )
-        snap = self._evaluation_snapshot()
-        recomputed = self._recompute_summary_from(snap)
+        # Stabilize: the comparison is only meaningful when the stored and
+        # recomputed summaries describe ONE state. The recompute itself can
+        # move the state — a metric timing out mid-recompute quarantines
+        # itself, which changes the token — and so can a concurrent commit;
+        # either would make this compare a pre-change summary against a
+        # post-change recomputation and raise a false divergence.
+        for _ in range(5):
+            snap = self._evaluation_snapshot()
+            recomputed = self._recompute_summary_from(snap)
+            if self._state_token() == snap.summary_token:
+                break
+        else:
+            raise ReconciliationError(
+                "could not capture a stable archive state to reconcile against "
+                "(concurrent writers kept committing); retry when writes settle"
+            )
         stored_pair = self._backend.read_summary()
         stored = None
         if stored_pair is not None:

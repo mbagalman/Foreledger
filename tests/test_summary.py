@@ -513,3 +513,47 @@ def test_failed_summary_data_write_leaves_no_tmp_files(
         with pytest.raises(OSError, match="ENOSPC"):
             populated.rebuild_summary()
     assert not list((populated.store / "summary").glob("*.tmp"))
+
+
+def test_metric_first_quarantined_during_reconcile_is_not_divergence(
+    tmp_path: object,
+) -> None:
+    """Review reproduction: a summarizable metric whose FIRST timeout happens
+    inside reconcile()'s recomputation changes the token mid-audit; the
+    comparison must restart against the new stable state instead of raising
+    a false ReconciliationError on a healthy archive."""
+    from pathlib import Path
+
+    archive = ForecastArchive(Path(str(tmp_path)) / "store", metric_timeout=0.2)
+    archive.ingest(forecast_frame(1.0), model_id="alpha", model_version="v1")
+    archive.register_actuals(actuals_frame())
+
+    hang = {"on": False}
+
+    def flaky(forecast: FloatArray, actual: FloatArray) -> float:
+        if hang["on"]:
+            time.sleep(1.0)
+        return float(np.mean(np.abs(forecast - actual)))
+
+    archive.register_metric("Flaky", flaky, summarizable=True)
+    assert (
+        archive.accuracy_at_horizon(
+            1, metric="Flaky", model_id="alpha", model_version="v1"
+        ).served_from
+        == "summary"
+    )
+
+    # the very next metric evaluation is the one inside reconcile()
+    hang["on"] = True
+    archive.reconcile()  # must not raise
+
+    # post-reconcile state is coherent: quarantined metric reads as
+    # insufficient on both routes, built-ins still summary-served
+    result = archive.accuracy_at_horizon(1, metric="Flaky", model_id="alpha", model_version="v1")
+    assert result.status == "insufficient"
+    assert (
+        archive.accuracy_at_horizon(
+            1, metric="MAE", model_id="alpha", model_version="v1"
+        ).served_from
+        == "summary"
+    )

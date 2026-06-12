@@ -68,12 +68,18 @@ def build_forecast_predicate(dialect: Dialect, flt: ForecastFilter) -> tuple[str
         clauses.append(f"{q('model_version')} = {ph}")
         params.append(flt.model_version)
     if flt.models is not None:
+        # an explicitly empty filter list matches nothing — and rendering an
+        # empty IN/OR group would be invalid SQL on some dialects
+        if not list(flt.models):
+            return "1 = 0", []
         pair = f"({q('model_id')} = {ph} AND {q('model_version')} = {ph})"
         clauses.append("(" + " OR ".join([pair] * len(flt.models)) + ")")
         for model_id, model_version in flt.models:
             params.extend([model_id, model_version])
     if flt.series is not None:
         series = list(flt.series)
+        if not series:
+            return "1 = 0", []
         clauses.append(f"{q('series_id')} IN ({', '.join([ph] * len(series))})")
         params.extend(series)
     if flt.horizon is not None:

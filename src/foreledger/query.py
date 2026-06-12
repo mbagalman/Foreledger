@@ -81,6 +81,13 @@ def _series_list(series: str | Sequence[str] | None) -> list[str] | None:
             values = [str(s) for s in series]
         except TypeError as exc:
             raise ValidationError("series must be a string or an iterable of strings") from exc
+    if not values:
+        # almost certainly an upstream filter that came up empty — explicit
+        # beats a silent empty scope (and an empty SQL IN list is invalid on
+        # some dialects)
+        raise ValidationError(
+            "series lists at least one series id; pass series=None for all series"
+        )
     if ALL_SERIES in values:
         # '*' names the pooled summary cells; accepting it here would make
         # the summary route answer "all series pooled" while the raw route

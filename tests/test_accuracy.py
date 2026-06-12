@@ -198,3 +198,32 @@ def test_query_inputs_are_validated(populated: ForecastArchive) -> None:
         populated.accuracy_at_horizon(
             1, model_id="alpha", model_version="v1", period=(20260101, 20260301)
         )
+
+
+def test_empty_series_scope_is_a_typed_error(populated: ForecastArchive) -> None:
+    """Review reproduction: series=[] previously rendered invalid SQL
+    ("series_id" IN ()) and leaked a DuckDB ParserException through every
+    public read API."""
+    from foreledger import ValidationError
+
+    with pytest.raises(ValidationError, match="at least one"):
+        populated.accuracy_at_horizon(1, series=[], model_id="alpha", model_version="v1")
+    with pytest.raises(ValidationError, match="at least one"):
+        populated.accuracy_curve(series=[], model_id="alpha", model_version="v1")
+    with pytest.raises(ValidationError, match="at least one"):
+        populated.as_of("2100-01-01", series=[])
+    with pytest.raises(ValidationError, match="at least one"):
+        populated.compare_models(1, [("alpha", "v1")], series=[])
+
+
+def test_predicate_builder_never_renders_empty_in_lists() -> None:
+    """Dialect-portability belt and braces below the API validation: an
+    explicitly empty filter list compiles to a match-nothing predicate, not
+    to invalid SQL."""
+    from foreledger.backend.base import Dialect, ForecastFilter, build_forecast_predicate
+
+    dialect = Dialect(name="test", placeholder="?")
+    empty_series = ForecastFilter(active_run_ids=["r1"], segments=["s"], series=[])
+    assert build_forecast_predicate(dialect, empty_series) == ("1 = 0", [])
+    empty_models = ForecastFilter(active_run_ids=["r1"], segments=["s"], models=[])
+    assert build_forecast_predicate(dialect, empty_models) == ("1 = 0", [])
