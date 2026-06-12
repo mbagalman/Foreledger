@@ -303,3 +303,67 @@ def test_summary_parquet_is_disposable(populated: ForecastArchive) -> None:
 def test_pandas_polars_interop_return_shape(populated: ForecastArchive) -> None:
     frame = populated.compare_models(1, [("alpha", "v1"), ("beta", "v1")])
     assert isinstance(frame, pd.DataFrame)
+
+
+def test_forecast_replay_repairs_absent_summary_promptly(populated: ForecastArchive) -> None:
+    """Review reproduction: the no-op replay path must refresh the summary
+    OUTSIDE the store lock — the publication re-acquires the (non-reentrant)
+    lock, so an in-lock refresh self-times-out and silently skips the
+    promised repair."""
+    summary_data_file(populated).unlink()
+    assert (
+        populated.accuracy_at_horizon(1, model_id="alpha", model_version="v1").served_from == "raw"
+    )
+
+    started = time.monotonic()
+    replay = populated.ingest(forecast_frame(1.0), model_id="alpha", model_version="v1")
+    elapsed = time.monotonic() - started
+    assert replay.n_runs_written == 0
+    assert elapsed < 20  # never the 30s self-timeout
+    # repaired immediately — no intervening reconcile()
+    assert (
+        populated.accuracy_at_horizon(1, model_id="alpha", model_version="v1").served_from
+        == "summary"
+    )
+
+
+def test_actuals_replay_repairs_absent_summary_promptly(populated: ForecastArchive) -> None:
+    summary_data_file(populated).unlink()
+
+    started = time.monotonic()
+    populated.register_actuals(actuals_frame(), recorded_at="2026-02-01")  # exact replay
+    elapsed = time.monotonic() - started
+    assert elapsed < 20  # never the 30s self-timeout
+    assert (
+        populated.accuracy_at_horizon(1, model_id="alpha", model_version="v1").served_from
+        == "summary"
+    )
+
+
+def test_failed_pointer_publication_does_not_leak_generations(
+    populated: ForecastArchive, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review reproduction: a generation whose pointer write fails is swept
+    immediately — repeated refresh failures must not grow disk use."""
+    import foreledger.backend.duckdb_backend as backend_module
+
+    summary_dir = populated.store / "summary"
+
+    def count() -> int:
+        return len(list(summary_dir.glob("summary-*.parquet")))
+
+    before = count()
+
+    def failing_pointer(path, payload, indent=1):  # type: ignore[no-untyped-def]
+        raise OSError("simulated metadata write failure")
+
+    monkeypatch.setattr(backend_module, "atomic_write_json", failing_pointer)
+    for _ in range(3):
+        with pytest.raises(OSError, match="simulated"):
+            populated.rebuild_summary()
+    assert count() == before  # no orphaned generations accumulated
+
+    # restored, publication works again
+    monkeypatch.undo()
+    populated.rebuild_summary()
+    populated.reconcile()

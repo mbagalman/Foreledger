@@ -350,33 +350,35 @@ class ForecastArchive:
             planned, skipped = plan_runs(canonical, self._manifest, on_conflict)
             if not planned:
                 logger.info("ingest was a no-op: %d run(s) already present", skipped)
-                # An idempotent replay is also the retry path after a failed
-                # summary refresh — repair the summary before returning.
-                self._refresh_summary_after_write()
-                return IngestResult(
+                result = IngestResult(
                     n_rows=0, n_runs_written=0, n_runs_skipped=skipped, n_runs_superseded=0
                 )
-            staged: list[str] = []
+            else:
+                staged: list[str] = []
 
-            def stage(tokens: Sequence[str], candidate_payload: dict[str, Any]) -> None:
-                self._stage_commit(tokens, "runs.json", candidate_payload)
-                staged.extend(tokens)
+                def stage(tokens: Sequence[str], candidate_payload: dict[str, Any]) -> None:
+                    self._stage_commit(tokens, "runs.json", candidate_payload)
+                    staged.extend(tokens)
 
-            result, committed = commit_runs(
-                planned,
-                self._manifest,
-                self._backend.write_forecast_segment,
-                now=pd.Timestamp.now(),
-                stage_integrity=stage,
-            )
-            # swap only after the durable save succeeded; a failed commit
-            # leaves this handle's view at its pre-call state
-            self._manifest = committed
-            self._manifest_digest = file_digest(self._manifest_path)
-            self._manifest_key = self._manifest_file_key()
-            self._confirm_commit(staged, "runs.json", committed.payload())
+                committed_result, committed = commit_runs(
+                    planned,
+                    self._manifest,
+                    self._backend.write_forecast_segment,
+                    now=pd.Timestamp.now(),
+                    stage_integrity=stage,
+                )
+                # swap only after the durable save succeeded; a failed commit
+                # leaves this handle's view at its pre-call state
+                self._manifest = committed
+                self._manifest_digest = file_digest(self._manifest_path)
+                self._manifest_key = self._manifest_file_key()
+                self._confirm_commit(staged, "runs.json", committed.payload())
+                result = dataclasses.replace(committed_result, n_runs_skipped=skipped)
+        # Outside the lock (StoreLock is non-reentrant and the summary
+        # publication re-acquires it) — on the no-op path too: an idempotent
+        # replay is the documented retry after a failed summary refresh.
         self._refresh_summary_after_write()
-        return dataclasses.replace(result, n_runs_skipped=skipped)
+        return result
 
     def ingest_nixtla(
         self,
@@ -490,56 +492,58 @@ class ForecastArchive:
                             "conflict audit records still cannot be written"
                         ) from exc
                 logger.info("registration was a no-op (exact replay)")
-                self._refresh_summary_after_write()
-                return
-
-            # The conflict audit channel is required: detect the new
-            # ambiguities this batch would create and prove the destination
-            # writable BEFORE any durable side effect — but write the entries
-            # only AFTER the visibility commit, so the audit log never
-            # describes an ambiguity that was never committed.
-            if new_rows.empty:
-                combined = existing
-            elif existing.empty:
-                combined = new_rows
             else:
-                combined = pd.concat([existing, new_rows], ignore_index=True)
-            pending_conflicts = self._pending_conflicts(combined)
-            if pending_conflicts:
-                self._preflight_error_log()
+                # The conflict audit channel is required: detect the new
+                # ambiguities this batch would create and prove the destination
+                # writable BEFORE any durable side effect — but write the
+                # entries only AFTER the visibility commit, so the audit log
+                # never describes an ambiguity that was never committed.
+                if new_rows.empty:
+                    combined = existing
+                elif existing.empty:
+                    combined = new_rows
+                else:
+                    combined = pd.concat([existing, new_rows], ignore_index=True)
+                pending_conflicts = self._pending_conflicts(combined)
+                if pending_conflicts:
+                    self._preflight_error_log()
 
-            # Segments are written invisibly; the manifest save below is the
-            # single visibility point, so the actual rows and their official
-            # designations appear together or not at all. A failure anywhere
-            # before it leaves only invisible files — any retry is clean.
-            actuals_segment = (
-                self._backend.append_actuals_segment(new_rows) if not new_rows.empty else None
-            )
-            officials_segment = (
-                self._backend.append_officials_segment(designations)
-                if designations is not None
-                else None
-            )
-            staged = [token for token in (actuals_segment, officials_segment) if token]
-            committed = manifest.extended(actuals_segment, officials_segment)
-            self._stage_commit(staged, "actuals_manifest.json", committed.payload())
-            committed.save()
-            self._actuals_manifest = committed
-            self._actuals_digest = file_digest(self._actuals_manifest_path)
-            self._actuals_key = self._actuals_manifest_file_key()
-            self._confirm_commit(staged, "actuals_manifest.json", committed.payload())
-            logger.info(
-                "registered %d actual(s)%s", len(new_rows), " as official" if official else ""
-            )
-            if pending_conflicts:
-                try:
-                    self._write_conflict_records(pending_conflicts)
-                except Exception as exc:
-                    raise ConflictLogError(
-                        "the registration committed durably, but writing its conflict "
-                        "audit records failed; the entries will be written by the next "
-                        "successful registration"
-                    ) from exc
+                # Segments are written invisibly; the manifest save below is
+                # the single visibility point, so the actual rows and their
+                # official designations appear together or not at all. A
+                # failure anywhere before it leaves only invisible files —
+                # any retry is clean.
+                actuals_segment = (
+                    self._backend.append_actuals_segment(new_rows) if not new_rows.empty else None
+                )
+                officials_segment = (
+                    self._backend.append_officials_segment(designations)
+                    if designations is not None
+                    else None
+                )
+                staged = [token for token in (actuals_segment, officials_segment) if token]
+                committed = manifest.extended(actuals_segment, officials_segment)
+                self._stage_commit(staged, "actuals_manifest.json", committed.payload())
+                committed.save()
+                self._actuals_manifest = committed
+                self._actuals_digest = file_digest(self._actuals_manifest_path)
+                self._actuals_key = self._actuals_manifest_file_key()
+                self._confirm_commit(staged, "actuals_manifest.json", committed.payload())
+                logger.info(
+                    "registered %d actual(s)%s", len(new_rows), " as official" if official else ""
+                )
+                if pending_conflicts:
+                    try:
+                        self._write_conflict_records(pending_conflicts)
+                    except Exception as exc:
+                        raise ConflictLogError(
+                            "the registration committed durably, but writing its conflict "
+                            "audit records failed; the entries will be written by the next "
+                            "successful registration"
+                        ) from exc
+        # Outside the lock (StoreLock is non-reentrant and the summary
+        # publication re-acquires it) — on the replay path too: an exact
+        # replay is the documented retry after a failed summary refresh.
         self._refresh_summary_after_write()
 
     def mark_official(

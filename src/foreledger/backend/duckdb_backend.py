@@ -123,11 +123,18 @@ class DuckDBBackend(Backend):
         # another writer's about-to-be-published generation.)
         name = f"summary-{uuid.uuid4().hex}.parquet"
         self._atomic_write(frame, self.summary_dir / name)
-        atomic_write_json(
-            self.summary_dir / "summary_meta.json",
-            {"state_token": state_token, "data": name},
-            indent=None,
-        )
+        try:
+            atomic_write_json(
+                self.summary_dir / "summary_meta.json",
+                {"state_token": state_token, "data": name},
+                indent=None,
+            )
+        except BaseException:
+            # the generation was never published: remove it so repeated
+            # refresh failures cannot accumulate orphaned summary files
+            with contextlib.suppress(OSError):
+                (self.summary_dir / name).unlink()
+            raise
         for stale in self.summary_dir.glob("summary*.parquet"):
             if stale.name != name:
                 # best-effort: a reader holding the old generation open keeps
