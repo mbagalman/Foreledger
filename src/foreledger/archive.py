@@ -40,6 +40,7 @@ from .actuals import (
 from .backend import Backend, ForecastFilter, create_backend
 from .errors import (
     ConflictLogError,
+    PartialCommitError,
     ReconciliationError,
     StoreFormatError,
     ValidationError,
@@ -52,11 +53,11 @@ from .ingestion import (
     load_manifest_entries,
     plan_runs,
 )
-from .integrity import SegmentIntegrity, mark_committed, reconcile_journal, record_segments
-from .jsonstore import atomic_write_json, file_key
+from .integrity import SegmentIntegrity, confirm_commit, reconcile_journal, stage_commit
+from .jsonstore import atomic_write_json, file_digest, file_key, json_digest
 from .locking import StoreLock
 from .metrics import DEFAULT_METRIC_TIMEOUT, MetricFn, MetricRegistry
-from .query import Evaluator, Period
+from .query import Evaluator, Period, QuerySnapshot
 from .results import AccuracyCurve, AccuracyResult
 from .schema import FORMAT_VERSION
 from .summary import build_summary
@@ -118,6 +119,8 @@ class ForecastArchive:
             # on the shared metadata temp file otherwise
             stored_version = self._check_or_init_store()
         self._backend: Backend = create_backend(backend, self.store)
+        self._journal: SegmentIntegrity | None = None
+        self._journal_key: tuple[int, int] | None = None
         with self._lock():
             if stored_version == 1:
                 self._migrate_v1_actuals_visibility()
@@ -126,8 +129,10 @@ class ForecastArchive:
                 RunManifest(path=self._manifest_path).save()
             self._manifest = self._load_manifest()
             self._manifest_key = self._manifest_file_key()
+            self._manifest_digest = file_digest(self._manifest_path)
             self._actuals_manifest = self._load_actuals_manifest()
             self._actuals_key = self._actuals_manifest_file_key()
+            self._actuals_digest = file_digest(self._actuals_manifest_path)
             if stored_version < FORMAT_VERSION:
                 self._migrate_to_v3()
             else:
@@ -144,16 +149,13 @@ class ForecastArchive:
         self._registry = MetricRegistry(timeout=metric_timeout)
         self._evaluator = Evaluator(
             backend=self._backend,
-            # late-bound and freshness-checked: reads see other handles'
-            # commits, and run ids + segments come from one manifest snapshot
-            forecast_visibility=self._forecast_visibility,
             registry=self._registry,
             source_priority=self._source_priority,
             champions=self.champions,
-            summary_provider=self._valid_summary,
-            actuals_provider=self._visible_actuals,
-            officials_provider=self._visible_officials,
-            integrity_check=self._verify_committed_segments,
+            # every public read works against ONE coherent capture of the
+            # run manifest, actuals manifest, and integrity journal — a
+            # concurrent commit can never make a single call mix states
+            snapshot_provider=self._evaluation_snapshot,
         )
 
     def _lock(self) -> StoreLock:
@@ -181,23 +183,61 @@ class ForecastArchive:
     def _current_manifest(self) -> RunManifest:
         """The manifest, reloaded if another handle has committed since this
         one last read it — long-lived handles must not serve superseded or
-        incomplete run sets indefinitely."""
+        incomplete run sets indefinitely. The parsed manifest, its file key,
+        and its content digest are cached as one coherent triple: the key is
+        re-checked after the reads, retrying if a concurrent commit landed
+        in between."""
         key = self._manifest_file_key()
-        if key != self._manifest_key:
-            self._manifest = RunManifest.load(self._manifest_path)
-            self._manifest_key = key
-        return self._manifest
+        for _ in range(8):
+            if key == self._manifest_key:
+                return self._manifest
+            manifest = RunManifest.load(self._manifest_path)
+            digest = file_digest(self._manifest_path)
+            after = self._manifest_file_key()
+            if after == key:
+                self._manifest = manifest
+                self._manifest_digest = digest
+                self._manifest_key = key
+                return self._manifest
+            key = after
+        raise StoreFormatError(
+            f"run manifest at {self._manifest_path} kept changing during reads; "
+            "a writer may be stuck in a commit loop"
+        )
 
     def _actuals_manifest_file_key(self) -> tuple[int, int] | None:
         return file_key(self._actuals_manifest_path)
 
     def _current_actuals_manifest(self) -> ActualsManifest:
-        """The actuals manifest, reloaded if another handle has committed."""
+        """The actuals manifest, reloaded if another handle has committed;
+        same coherent (manifest, key, digest) caching as the run manifest."""
         key = self._actuals_manifest_file_key()
-        if key != self._actuals_key:
-            self._actuals_manifest = ActualsManifest.load(self._actuals_manifest_path)
-            self._actuals_key = key
-        return self._actuals_manifest
+        for _ in range(8):
+            if key == self._actuals_key:
+                return self._actuals_manifest
+            manifest = ActualsManifest.load(self._actuals_manifest_path)
+            digest = file_digest(self._actuals_manifest_path)
+            after = self._actuals_manifest_file_key()
+            if after == key:
+                self._actuals_manifest = manifest
+                self._actuals_digest = digest
+                self._actuals_key = key
+                return self._actuals_manifest
+            key = after
+        raise StoreFormatError(
+            f"actuals manifest at {self._actuals_manifest_path} kept changing "
+            "during reads; a writer may be stuck in a commit loop"
+        )
+
+    def _current_journal(self) -> SegmentIntegrity:
+        """The integrity journal, freshness-cached like the manifests (it is
+        parsed on every integrity probe, so re-parsing only on change keeps
+        the per-query cost at one stat)."""
+        key = file_key(self._integrity_path)
+        if self._journal is None or key != self._journal_key:
+            self._journal = SegmentIntegrity.load(self._integrity_path)
+            self._journal_key = key
+        return self._journal
 
     def _visible_actuals(self) -> pd.DataFrame:
         return self._backend.read_actuals(self._current_actuals_manifest().actuals)
@@ -216,8 +256,16 @@ class ForecastArchive:
 
     def _migrate_to_v3(self) -> None:
         lifecycle.migrate_to_v3(
-            self.store, self._backend, self._integrity_path, self._referenced_tokens()
+            self.store,
+            self._backend,
+            self._integrity_path,
+            self._referenced_tokens(),
+            manifest_digests={
+                "runs.json": file_digest(self._manifest_path),
+                "actuals_manifest.json": file_digest(self._actuals_manifest_path),
+            },
         )
+        self._journal_key = None
 
     def _load_manifest(self) -> RunManifest:
         """Load the run manifest, migrating legacy (per series-set) records.
@@ -236,8 +284,11 @@ class ForecastArchive:
             self._backend,
             self._manifest_path,
             entries,
-            record_integrity=lambda tokens: self._record_segment_integrity(
-                tokens, committed=True, create_if_missing=True
+            stage_integrity=lambda tokens, payload: self._stage_commit(
+                tokens, "runs.json", payload, create_if_missing=True
+            ),
+            confirm_integrity=lambda tokens, payload: self._confirm_commit(
+                tokens, "runs.json", payload
             ),
         )
 
@@ -286,12 +337,15 @@ class ForecastArchive:
         """
         canonical = canonicalize_forecasts(frame, mapping, model_id, model_version, origin)
         with self._lock():
-            # strict preflight: never commit new data into a store whose
-            # existing committed state is already corrupt
+            # strict preflight: heal any crashed/failed commit's journal
+            # state (so an exact retry completes its bookkeeping), then never
+            # commit new data into a store whose committed state is corrupt
+            self._reconcile_integrity_records()
             self._verify_committed_segments()
             # plan against a fresh snapshot so concurrent handles merge
             # instead of clobbering each other's committed runs
             self._manifest = RunManifest.load(self._manifest_path)
+            self._manifest_digest = file_digest(self._manifest_path)
             self._manifest_key = self._manifest_file_key()
             planned, skipped = plan_runs(canonical, self._manifest, on_conflict)
             if not planned:
@@ -304,8 +358,8 @@ class ForecastArchive:
                 )
             staged: list[str] = []
 
-            def record_staged(tokens: Sequence[str]) -> None:
-                self._record_segment_integrity(tokens)
+            def stage(tokens: Sequence[str], candidate_payload: dict[str, Any]) -> None:
+                self._stage_commit(tokens, "runs.json", candidate_payload)
                 staged.extend(tokens)
 
             result, committed = commit_runs(
@@ -313,13 +367,14 @@ class ForecastArchive:
                 self._manifest,
                 self._backend.write_forecast_segment,
                 now=pd.Timestamp.now(),
-                record_integrity=record_staged,
+                stage_integrity=stage,
             )
             # swap only after the durable save succeeded; a failed commit
             # leaves this handle's view at its pre-call state
             self._manifest = committed
+            self._manifest_digest = file_digest(self._manifest_path)
             self._manifest_key = self._manifest_file_key()
-            self._mark_segments_committed(staged)
+            self._confirm_commit(staged, "runs.json", committed.payload())
         self._refresh_summary_after_write()
         return dataclasses.replace(result, n_runs_skipped=skipped)
 
@@ -398,8 +453,9 @@ class ForecastArchive:
         """
         batch = canonicalize_actuals(frame, mapping, source, recorded_at, official)
         with self._lock():
-            # strict preflight: never commit new data into a store whose
-            # existing committed state is already corrupt
+            # strict preflight: heal any crashed/failed commit's journal
+            # state, then never commit new data into a corrupt store
+            self._reconcile_integrity_records()
             self._verify_committed_segments()
             manifest = self._current_actuals_manifest()
             existing = self._backend.read_actuals(manifest.actuals)
@@ -465,13 +521,13 @@ class ForecastArchive:
                 else None
             )
             staged = [token for token in (actuals_segment, officials_segment) if token]
-            self._record_segment_integrity(staged)
-
             committed = manifest.extended(actuals_segment, officials_segment)
+            self._stage_commit(staged, "actuals_manifest.json", committed.payload())
             committed.save()
             self._actuals_manifest = committed
+            self._actuals_digest = file_digest(self._actuals_manifest_path)
             self._actuals_key = self._actuals_manifest_file_key()
-            self._mark_segments_committed(staged)
+            self._confirm_commit(staged, "actuals_manifest.json", committed.payload())
             logger.info(
                 "registered %d actual(s)%s", len(new_rows), " as official" if official else ""
             )
@@ -503,8 +559,9 @@ class ForecastArchive:
         """
         validate_source_label(source)
         with self._lock():
-            # strict preflight: never commit new data into a store whose
-            # existing committed state is already corrupt
+            # strict preflight: heal any crashed/failed commit's journal
+            # state, then never commit new data into a corrupt store
+            self._reconcile_integrity_records()
             self._verify_committed_segments()
             manifest = self._current_actuals_manifest()
             actuals = self._backend.read_actuals(manifest.actuals)
@@ -519,12 +576,13 @@ class ForecastArchive:
                 }
             )
             segment = self._backend.append_officials_segment(designation)
-            self._record_segment_integrity([segment])
             committed = manifest.extended(None, segment)
+            self._stage_commit([segment], "actuals_manifest.json", committed.payload())
             committed.save()
             self._actuals_manifest = committed
+            self._actuals_digest = file_digest(self._actuals_manifest_path)
             self._actuals_key = self._actuals_manifest_file_key()
-            self._mark_segments_committed([segment])
+            self._confirm_commit([segment], "actuals_manifest.json", committed.payload())
         logger.info("official designation recorded")
         self._refresh_summary_after_write()
 
@@ -552,31 +610,35 @@ class ForecastArchive:
         self._registry.register(name, fn, summarizable=summarizable)
         self._refresh_summary_after_write()
 
-    # -- summary maintenance -------------------------------------------------
+    # -- evaluation snapshot & summary maintenance ----------------------------
 
-    def _raw_state(self) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        run_ids, segments = self._forecast_visibility()
+    def _recompute_summary_from(self, snap: QuerySnapshot) -> pd.DataFrame:
+        """Recompute the full summary from exactly the snapshot's segments,
+        so the (frame, token) pair is always internally coherent even if
+        concurrent commits land mid-computation."""
         forecasts = self._backend.read_forecasts(
-            ForecastFilter(active_run_ids=run_ids, segments=segments)
+            ForecastFilter(active_run_ids=snap.run_ids, segments=snap.segments)
         )
-        return forecasts, self._visible_actuals(), self._visible_officials()
-
-    def _recompute_summary(self) -> pd.DataFrame:
-        forecasts, actuals, officials = self._raw_state()
+        actuals = self._backend.read_actuals(snap.actuals_segments)
+        officials = self._backend.read_officials(snap.officials_segments)
         latest = resolve_effective_latest(actuals, self._source_priority).latest
         official = resolve_effective_official(actuals, officials)
         return build_summary(forecasts, latest, official, self._registry)
 
-    def _state_token(self) -> str:
+    def _state_token_from(
+        self,
+        manifest: RunManifest,
+        actuals_manifest: ActualsManifest,
+        journal: SegmentIntegrity,
+    ) -> str:
         """Fingerprint of everything the summary is derived from: the active
         run set, the stored actuals/officials, the summarizable metric set,
         and the configured source priority (which steers same-timestamp
         tiebreaks). A summary stamped with a different token is never served.
         """
         digest = hashlib.sha256()
-        for run_id in sorted(self._current_manifest().active_run_ids()):
+        for run_id in sorted(manifest.active_run_ids()):
             digest.update(f"run:{run_id}\n".encode())
-        actuals_manifest = self._current_actuals_manifest()
         for name in sorted(actuals_manifest.actuals):
             digest.update(f"actuals:{name}\n".encode())
         for name in sorted(actuals_manifest.officials):
@@ -589,28 +651,89 @@ class ForecastArchive:
         # Recorded content fingerprints: re-blessing content (migration
         # adoption, manual registry repair) changes the recorded hashes and
         # therefore invalidates any summary built over the old bytes.
-        registry = SegmentIntegrity.load(self._integrity_path)
-        for token in sorted(registry.entries):
-            digest.update(f"integrity:{token}:{registry.entries[token]['sha256']}\n".encode())
+        for token in sorted(journal.entries):
+            digest.update(f"integrity:{token}:{journal.entries[token]['sha256']}\n".encode())
         return digest.hexdigest()
 
-    # -- visibility & integrity ----------------------------------------------
-    # (journal operations — record/mark/reconcile — live in foreledger.integrity;
-    # the delegates below bind this store's registry path and backend)
-
-    def _forecast_visibility(self) -> tuple[list[str], list[str]]:
-        """Active (run_ids, segment tokens) from ONE manifest snapshot.
-
-        Deriving the pair from two separate freshness-checked reads could
-        interleave with another handle's overwrite and combine old run ids
-        with new segments — a view that never existed.
-        """
-        manifest = self._current_manifest()
-        run_ids = manifest.active_run_ids()
-        segments = sorted(
-            {run.segment for run in manifest.runs if not run.superseded and run.segment}
+    def _state_token(self) -> str:
+        return self._state_token_from(
+            self._current_manifest(), self._current_actuals_manifest(), self._current_journal()
         )
-        return run_ids, segments
+
+    # -- visibility & integrity ----------------------------------------------
+    # (journal operations — stage/confirm/reconcile — live in
+    # foreledger.integrity; the delegates below bind this store's registry
+    # path and backend)
+
+    def _verify_manifest_binding(self, journal: SegmentIntegrity) -> None:
+        """Assert each visibility manifest's bytes match a digest the journal
+        recorded inside a commit (``current``, or ``pending`` for a commit
+        whose confirmation has not landed yet). Anything else is a selective
+        external edit — records removed, ``superseded`` flipped, identities
+        rewritten — which whole-segment orphan checks cannot see."""
+        for name, digest in (
+            ("runs.json", self._manifest_digest),
+            ("actuals_manifest.json", self._actuals_digest),
+        ):
+            slot = journal.manifests.get(name) or {}
+            if digest not in (slot.get("current"), slot.get("pending")):
+                raise StoreFormatError(
+                    f"{name} does not match its recorded content digest; visibility "
+                    "metadata was modified outside a commit"
+                )
+
+    def _evaluation_snapshot(self) -> QuerySnapshot:
+        """One coherent capture of the run manifest, actuals manifest, and
+        integrity journal for a public read.
+
+        The three live in separate files, so the capture is optimistic: read
+        all three, then re-check their file keys — if a concurrent commit
+        moved any of them mid-capture, retry; persistent churn falls back to
+        a brief hold of the store lock, which excludes writers. The captured
+        manifests are then digest-verified against the journal and the
+        committed segments integrity-probed, and the snapshot's summary
+        token is derived from the captured state — so the summary can only
+        serve a query whose raw fallback would read the very same state.
+        Segment files themselves are immutable, which is what makes a
+        captured token list a stable point-in-time view.
+        """
+        for _ in range(8):
+            snap = self._try_capture_snapshot()
+            if snap is not None:
+                return snap
+        with self._lock():
+            snap = self._try_capture_snapshot()
+            if snap is None:  # pragma: no cover - writers are excluded here
+                raise StoreFormatError(
+                    "store metadata kept changing while the lock was held; the "
+                    "store directory is being modified externally"
+                )
+            return snap
+
+    def _try_capture_snapshot(self) -> QuerySnapshot | None:
+        manifest = self._current_manifest()
+        manifest_key = self._manifest_key
+        actuals_manifest = self._current_actuals_manifest()
+        actuals_key = self._actuals_key
+        journal = self._current_journal()
+        journal_key = self._journal_key
+        if (
+            self._manifest_file_key() != manifest_key
+            or self._actuals_manifest_file_key() != actuals_key
+            or file_key(self._integrity_path) != journal_key
+        ):
+            return None
+        self._verify_manifest_binding(journal)
+        self._verify_committed_segments()
+        return QuerySnapshot(
+            run_ids=manifest.active_run_ids(),
+            segments=sorted(
+                {run.segment for run in manifest.runs if not run.superseded and run.segment}
+            ),
+            actuals_segments=list(actuals_manifest.actuals),
+            officials_segments=list(actuals_manifest.officials),
+            summary_token=self._state_token_from(manifest, actuals_manifest, journal),
+        )
 
     def _referenced_tokens(self) -> list[str]:
         """Every segment referenced by any record — including superseded
@@ -626,21 +749,62 @@ class ForecastArchive:
         )
 
     def _reconcile_integrity_records(self) -> None:
-        reconcile_journal(self._integrity_path, set(self._referenced_tokens()))
+        """Heal the commit journal (caller holds the store lock): promote a
+        crashed commit's pending state, prune failed-write orphans, and raise
+        on visibility metadata edited outside a commit. Runs at open and as
+        the first step of every locked write, so an exact retry after a
+        failed post-commit confirmation completes the bookkeeping."""
+        reconcile_journal(
+            self._integrity_path,
+            set(self._referenced_tokens()),
+            {
+                "runs.json": file_digest(self._manifest_path),
+                "actuals_manifest.json": file_digest(self._actuals_manifest_path),
+            },
+        )
+        self._journal_key = None
 
-    def _record_segment_integrity(
-        self, tokens: Sequence[str], *, committed: bool = False, create_if_missing: bool = False
+    def _stage_commit(
+        self,
+        tokens: Sequence[str],
+        manifest_name: str,
+        manifest_payload: dict[str, Any],
+        *,
+        create_if_missing: bool = False,
     ) -> None:
-        record_segments(
+        """Phase one of a visibility commit: journal the staged fingerprints
+        and the candidate manifest's content digest, before the manifest
+        file changes."""
+        stage_commit(
             self._integrity_path,
             self._backend.fingerprint_segment,
             tokens,
-            committed=committed,
+            manifest_name,
+            json_digest(manifest_payload),
             create_if_missing=create_if_missing,
         )
+        self._journal_key = None
 
-    def _mark_segments_committed(self, tokens: Sequence[str]) -> None:
-        mark_committed(self._integrity_path, tokens)
+    def _confirm_commit(
+        self, tokens: Sequence[str], manifest_name: str, manifest_payload: dict[str, Any]
+    ) -> None:
+        """Phase two, after the manifest save: flip staged entries and
+        promote the digest. The data is already visible at this point, so a
+        failure here is reported as :class:`PartialCommitError` — never as a
+        plain failure of a write that actually committed."""
+        try:
+            confirm_commit(
+                self._integrity_path, tokens, manifest_name, json_digest(manifest_payload)
+            )
+        except Exception as exc:
+            raise PartialCommitError(
+                "the write committed durably and its data is visible, but the "
+                "integrity-journal confirmation failed; the next write (an exact "
+                "retry of this call is a safe no-op) or the next open completes "
+                "the bookkeeping"
+            ) from exc
+        finally:
+            self._journal_key = None
 
     def _verify_committed_segments(self) -> None:
         """Assert every referenced segment's data is present and unmodified.
@@ -662,7 +826,7 @@ class ForecastArchive:
                 f"(e.g. {missing[0]!r}); raw archive data was deleted or modified "
                 "externally"
             )
-        registry = SegmentIntegrity.load(self._integrity_path)
+        registry = self._current_journal()
         modified = [
             token
             for token in referenced
@@ -687,8 +851,10 @@ class ForecastArchive:
             # fresh manifest read must reference it. Only a persistent orphan
             # is a truncated/tampered manifest.
             self._manifest = RunManifest.load(self._manifest_path)
+            self._manifest_digest = file_digest(self._manifest_path)
             self._manifest_key = self._manifest_file_key()
             self._actuals_manifest = ActualsManifest.load(self._actuals_manifest_path)
+            self._actuals_digest = file_digest(self._actuals_manifest_path)
             self._actuals_key = self._actuals_manifest_file_key()
             referenced_set = set(self._referenced_tokens())
             orphaned = [token for token in orphaned if token not in referenced_set]
@@ -713,9 +879,18 @@ class ForecastArchive:
         return frame
 
     def rebuild_summary(self) -> None:
-        """Recompute the disposable summary from raw and store it."""
-        token = self._state_token()
-        self._backend.replace_summary(self._recompute_summary(), token)
+        """Recompute the disposable summary from raw and store it.
+
+        Computed from one evaluation snapshot (so the frame and its validity
+        token always describe the same state) and replaced under the store
+        lock (so two handles' rebuilds serialize — interleaved data/token
+        writes could otherwise pair one handle's data with the other's
+        token, and the two can legitimately differ via source priority or
+        registered metrics)."""
+        snap = self._evaluation_snapshot()
+        frame = self._recompute_summary_from(snap)
+        with self._lock():
+            self._backend.replace_summary(frame, snap.summary_token)
 
     def _refresh_summary_after_write(self) -> None:
         """Eagerly refresh the summary after a raw write, without letting a
@@ -747,7 +922,7 @@ class ForecastArchive:
         committed segment (queries only probe size/mtime).
         """
         self._verify_committed_segments()
-        registry = SegmentIntegrity.load(self._integrity_path)
+        registry = self._current_journal()
         for token in self._referenced_tokens():
             record = registry.entries.get(token)
             fingerprint = self._backend.fingerprint_segment(token)
@@ -756,12 +931,19 @@ class ForecastArchive:
                     f"committed segment {token!r} does not match its recorded "
                     "content hash; raw archive data was modified externally"
                 )
-        recomputed = self._recompute_summary()
-        stored = self._valid_summary()
+        snap = self._evaluation_snapshot()
+        recomputed = self._recompute_summary_from(snap)
+        stored_pair = self._backend.read_summary()
+        stored = None
+        if stored_pair is not None:
+            frame, token = stored_pair
+            if token == snap.summary_token and "n_forecasts" in frame.columns:
+                stored = frame
         if stored is None:
             # absent or stale: rebuild rather than diagnose — it was never
             # being served
-            self._backend.replace_summary(recomputed, self._state_token())
+            with self._lock():
+                self._backend.replace_summary(recomputed, snap.summary_token)
             return
         key = [
             "actual_basis",

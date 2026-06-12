@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from tests.conftest import actuals_frame, forecast_frame
 
 from foreledger import ForecastArchive
@@ -113,3 +114,95 @@ def test_actuals_appends_from_two_handles_both_land(store: Path) -> None:
     reopened = ForecastArchive(store)
     assert len(reopened._visible_actuals()) == len(actuals)
     reopened.reconcile()
+
+
+def test_one_call_cannot_mix_summary_and_raw_states(
+    store: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review reproduction: a curve whose first point is summary-served and
+    whose second point falls back to raw must answer entirely from ONE
+    archive state, even when another handle commits a revision mid-call."""
+    import pandas as pd
+
+    handle_a = ForecastArchive(store)
+    forecasts = pd.DataFrame(
+        {
+            "series_id": ["s1", "s1"],
+            "target": pd.to_datetime(["2026-01-02", "2026-01-03"]),
+            "value": [10.0, 10.0],
+        }
+    )
+    handle_a.ingest(forecasts, model_id="alpha", model_version="v1", origin="2026-01-01")
+    # horizon 1 covered (MAE 1.0); horizon 2 has no actual yet (insufficient,
+    # so it has no summary cell and always computes from raw)
+    first_actual = pd.DataFrame(
+        {"series_id": ["s1"], "target": pd.to_datetime(["2026-01-02"]), "value": [9.0]}
+    )
+    handle_a.register_actuals(first_actual, recorded_at="2026-01-10")
+
+    handle_b = ForecastArchive(store)
+    revision = pd.DataFrame(
+        {
+            "series_id": ["s1", "s1"],
+            "target": pd.to_datetime(["2026-01-02", "2026-01-03"]),
+            "value": [10.0, 9.0],  # h1 error becomes 0.0; h2 becomes scorable
+        }
+    )
+
+    # interleave: B's revision commits right after A reads the stored summary
+    real_read = handle_a._backend.read_summary
+    fired = {"done": False}
+
+    def read_then_commit():  # type: ignore[no-untyped-def]
+        stored = real_read()
+        if not fired["done"]:
+            fired["done"] = True
+            handle_b.register_actuals(revision, recorded_at="2026-01-20")
+        return stored
+
+    monkeypatch.setattr(handle_a._backend, "read_summary", read_then_commit)
+    curve = handle_a.accuracy_curve(
+        metric="MAE", model_id="alpha", model_version="v1", horizons=[1, 2]
+    )
+    assert fired["done"]
+    # entirely the BEFORE state: h1 from the old summary, h2 insufficient
+    # from the snapshot's raw segments — never old h1 with new h2
+    assert curve.points[0].value == 1.0
+    assert curve.points[1].status == "insufficient"
+
+    # a fresh call sees the AFTER state in full
+    monkeypatch.setattr(handle_a._backend, "read_summary", real_read)
+    after = handle_a.accuracy_curve(
+        metric="MAE", model_id="alpha", model_version="v1", horizons=[1, 2]
+    )
+    assert after.points[0].value == 0.0
+    assert after.points[1].value == 1.0
+
+
+def test_summary_replacement_holds_the_store_lock(
+    store: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review reproduction guard: the summary data + validity token must be
+    replaced while holding the store lock, so two handles' rebuilds can
+    never interleave one handle's data with the other's token."""
+    import pytest as _pytest
+
+    from foreledger import StoreLockTimeout
+    from foreledger.locking import StoreLock
+
+    archive = ForecastArchive(store)
+    archive.ingest(forecast_frame(1.0), model_id="alpha", model_version="v1")
+    archive.register_actuals(actuals_frame(), recorded_at="2026-02-01")
+
+    real_replace = archive._backend.replace_summary
+    probed = {"locked": False}
+
+    def probing_replace(frame, token):  # type: ignore[no-untyped-def]
+        with _pytest.raises(StoreLockTimeout), StoreLock(store / ".foreledger.lock", timeout=0.2):
+            pass
+        probed["locked"] = True
+        real_replace(frame, token)
+
+    monkeypatch.setattr(archive._backend, "replace_summary", probing_replace)
+    archive.rebuild_summary()
+    assert probed["locked"]

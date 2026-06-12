@@ -125,8 +125,13 @@ class RunManifest:
     def load(cls, path: Path) -> RunManifest:
         return cls.from_entries(path, load_manifest_entries(path))
 
+    def payload(self) -> dict[str, Any]:
+        """The exact JSON payload :meth:`save` writes — exposed so a commit
+        can journal the candidate manifest's content digest before saving."""
+        return {"runs": [asdict(run) for run in self.runs]}
+
     def save(self) -> None:
-        atomic_write_json(self.path, {"runs": [asdict(run) for run in self.runs]})
+        atomic_write_json(self.path, self.payload())
 
     def active_run_ids(self) -> list[str]:
         return [run.run_id for run in self.runs if not run.superseded]
@@ -337,7 +342,7 @@ def commit_runs(
     manifest: RunManifest,
     write_segment: Any,
     now: pd.Timestamp,
-    record_integrity: Any = None,
+    stage_integrity: Any = None,
 ) -> tuple[IngestResult, RunManifest]:
     """Write one invisible segment for the whole call, then commit visibility
     in one atomic manifest save.
@@ -345,6 +350,12 @@ def commit_runs(
     The segment file carries one ``run_id`` per planned (origin, series) run;
     visibility is row-level via the manifest's active run_ids, so superseding
     one series later never hides its neighbours in the same file.
+
+    ``stage_integrity(tokens, candidate_payload)`` is called after the
+    segment write and before the manifest save, so the integrity journal
+    holds the staged fingerprints and the candidate manifest's content digest
+    before anything becomes visible; the caller confirms the commit after
+    this function returns.
 
     ``manifest`` is never mutated: a candidate manifest is built and saved,
     and returned only after the save succeeds. If anything raises, the caller
@@ -375,10 +386,6 @@ def commit_runs(
     segment = write_segment(pd.concat(tagged_frames, ignore_index=True))
     for record in new_records:
         record.segment = segment
-    if record_integrity is not None:
-        # fingerprint before visibility: a committed segment always has its
-        # integrity record
-        record_integrity([segment])
 
     superseded_ids = {plan.supersedes.run_id for plan in planned if plan.supersedes is not None}
     candidate_runs = [
@@ -386,6 +393,11 @@ def commit_runs(
         for run in manifest.runs
     ]
     candidate = RunManifest(path=manifest.path, runs=[*candidate_runs, *new_records])
+    if stage_integrity is not None:
+        # journal before visibility: a committed segment always has its
+        # fingerprint, and the manifest's expected digest is recorded before
+        # the file changes
+        stage_integrity([segment], candidate.payload())
     candidate.save()
 
     n_rows = sum(len(frame) for frame in tagged_frames)

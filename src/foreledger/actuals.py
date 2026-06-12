@@ -133,8 +133,13 @@ class ActualsManifest:
             officials=cls._validated_tokens(payload, "officials", path),
         )
 
+    def payload(self) -> dict[str, Any]:
+        """The exact JSON payload :meth:`save` writes — exposed so a commit
+        can journal the candidate manifest's content digest before saving."""
+        return {"actuals": self.actuals, "officials": self.officials}
+
     def save(self) -> None:
-        atomic_write_json(self.path, {"actuals": self.actuals, "officials": self.officials})
+        atomic_write_json(self.path, self.payload())
 
     def extended(self, actuals: str | None, officials: str | None) -> ActualsManifest:
         """A new manifest with the given segment names appended (not saved)."""

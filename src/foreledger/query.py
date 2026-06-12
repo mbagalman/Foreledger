@@ -13,11 +13,15 @@ never silently substituted — unless the caller opts into
 ``fallback="latest"``, which fills them from the latest value and flags them
 in the result.
 
-Each public call works against one :class:`_QuerySnapshot`: integrity is
-verified once, the manifest visibility pair is taken from one snapshot, and
-the actuals are read and resolved once — so a fan-out call (a curve, a
+Each public call works against one :class:`QuerySnapshot`: integrity is
+verified once and the run manifest, actuals manifest, and integrity journal
+are captured coherently (the archive retries the capture if a concurrent
+commit lands mid-read). All raw reads scan only the snapshot's immutable
+segment lists, and the stored summary is served only when its validity token
+matches the token derived from the snapshot — so a fan-out call (a curve, a
 comparison) does the expensive work once instead of once per point, and a
-concurrent writer can never make a single call see a mix of states.
+concurrent writer can never make a single call mix two archive states (for
+example, old summary cells with newly revised actuals).
 """
 
 from __future__ import annotations
@@ -70,15 +74,23 @@ def _coverage_status(usable: bool, n_missing: int) -> Literal["ok", "partial", "
 
 
 @dataclass
-class _QuerySnapshot:
-    """Per-public-call cache of everything expensive or consistency-critical.
+class QuerySnapshot:
+    """One coherent capture of the archive's visible state for a public call.
 
-    Built after one integrity verification, from one manifest snapshot.
-    Lazy fields are populated at most once per call.
+    Built by the archive after one integrity verification, from one stable
+    read of the run manifest, actuals manifest, and integrity journal.
+    Segment files are immutable, so the captured token lists stay a faithful
+    point-in-time view however long the call takes; ``summary_token`` is the
+    validity token *derived from this snapshot*, so the stored summary can
+    serve only queries whose raw fallback would read the same state. Lazy
+    fields are populated at most once per call.
     """
 
     run_ids: list[str]
     segments: list[str]
+    actuals_segments: list[str]
+    officials_segments: list[str]
+    summary_token: str
     summary: pd.DataFrame | None = None
     summary_loaded: bool = False
     actuals: pd.DataFrame | None = None
@@ -92,63 +104,52 @@ class Evaluator:
     def __init__(
         self,
         backend: Backend,
-        forecast_visibility: Callable[[], tuple[list[str], list[str]]],
         registry: MetricRegistry,
         source_priority: list[str] | None,
         champions: Callable[[], dict[str, str]],
-        summary_provider: Callable[[], pd.DataFrame | None],
-        actuals_provider: Callable[[], pd.DataFrame],
-        officials_provider: Callable[[], pd.DataFrame],
-        integrity_check: Callable[[], None],
+        snapshot_provider: Callable[[], QuerySnapshot],
     ) -> None:
         self._backend = backend
-        # the manifest is the single visibility point: active run ids and
-        # the committed segments to scan come from ONE snapshot of it, so a
-        # concurrent overwrite yields the before or after view, never a mix
-        self._forecast_visibility = forecast_visibility
         self._registry = registry
         self._source_priority = source_priority
         self._champions = champions
-        # Returns the stored summary only when it matches the current raw
-        # state (validity token); a stale or absent summary yields None and
-        # every query falls back to raw computation invisibly.
-        self._summary_provider = summary_provider
-        # Manifest-gated views of the actuals/officials logs: only rows whose
-        # visibility was committed are ever read.
-        self._actuals_provider = actuals_provider
-        self._officials_provider = officials_provider
-        # Raises a typed error when committed raw segments are missing —
-        # externally deleted data must never read as silently absent rows.
-        self._integrity_check = integrity_check
+        # One coherent, integrity-verified capture of the archive state per
+        # public call; raises a typed error on externally modified data.
+        self._snapshot_provider = snapshot_provider
 
     # -- snapshot plumbing ---------------------------------------------------
 
-    def _snapshot(self) -> _QuerySnapshot:
-        """One snapshot per public call: verify integrity, then capture the
-        visibility pair. Everything else on the snapshot loads lazily."""
-        self._integrity_check()
-        run_ids, segments = self._forecast_visibility()
-        return _QuerySnapshot(run_ids=run_ids, segments=segments)
+    def _snapshot(self) -> QuerySnapshot:
+        return self._snapshot_provider()
 
-    def _summary(self, snap: _QuerySnapshot) -> pd.DataFrame | None:
+    def _summary(self, snap: QuerySnapshot) -> pd.DataFrame | None:
+        """The stored summary, only if its validity token matches the
+        snapshot — a summary built before or after the captured state is
+        never mixed into this call; the query computes from the snapshot's
+        raw segments instead."""
         if not snap.summary_loaded:
-            snap.summary = self._summary_provider()
+            stored = self._backend.read_summary()
+            snap.summary = None
+            if stored is not None:
+                frame, token = stored
+                if token == snap.summary_token and "n_forecasts" in frame.columns:
+                    snap.summary = frame
             snap.summary_loaded = True
         return snap.summary
 
-    def _actuals(self, snap: _QuerySnapshot) -> pd.DataFrame:
+    def _actuals(self, snap: QuerySnapshot) -> pd.DataFrame:
         if snap.actuals is None:
-            snap.actuals = self._actuals_provider()
+            snap.actuals = self._backend.read_actuals(snap.actuals_segments)
         return snap.actuals
 
-    def _officials(self, snap: _QuerySnapshot) -> pd.DataFrame:
+    def _officials(self, snap: QuerySnapshot) -> pd.DataFrame:
         if snap.officials is None:
-            snap.officials = self._officials_provider()
+            snap.officials = self._backend.read_officials(snap.officials_segments)
         return snap.officials
 
     def _read_forecasts(
         self,
-        snap: _QuerySnapshot,
+        snap: QuerySnapshot,
         *,
         horizon: int | None = None,
         model_id: str | None = None,
@@ -172,7 +173,7 @@ class Evaluator:
         )
         return self._backend.read_forecasts(flt)
 
-    def _effective(self, snap: _QuerySnapshot, basis: str, fallback: str | None) -> pd.DataFrame:
+    def _effective(self, snap: QuerySnapshot, basis: str, fallback: str | None) -> pd.DataFrame:
         """Resolved actuals for a basis, with an ``is_fallback`` flag column;
         resolved once per public call and cached on the snapshot."""
         if basis not in ("latest", "official"):
@@ -210,7 +211,7 @@ class Evaluator:
 
     def _evaluate_raw(
         self,
-        snap: _QuerySnapshot,
+        snap: QuerySnapshot,
         *,
         horizon: int,
         metric: str,
@@ -257,7 +258,7 @@ class Evaluator:
 
     def _summary_lookup(
         self,
-        snap: _QuerySnapshot,
+        snap: QuerySnapshot,
         *,
         horizon: int,
         metric: str,
@@ -299,7 +300,7 @@ class Evaluator:
 
     def _accuracy(
         self,
-        snap: _QuerySnapshot,
+        snap: QuerySnapshot,
         h: int,
         *,
         metric: str,
@@ -349,7 +350,7 @@ class Evaluator:
 
     def _horizons(
         self,
-        snap: _QuerySnapshot,
+        snap: QuerySnapshot,
         *,
         model_id: str | None = None,
         model_version: str | None = None,
@@ -364,7 +365,7 @@ class Evaluator:
 
     def _compare_at(
         self,
-        snap: _QuerySnapshot,
+        snap: QuerySnapshot,
         h: int,
         models: Sequence[tuple[str, str]],
         champions: dict[str, str],

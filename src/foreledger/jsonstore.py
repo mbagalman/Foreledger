@@ -9,10 +9,23 @@ live.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
 from typing import Any
+
+
+def json_digest(payload: Any, indent: int | None = 1) -> str:
+    """sha256 over exactly the bytes :func:`atomic_write_json` would write
+    for ``payload`` — so a digest can be computed *before* the file lands
+    and later compared against :func:`file_digest` of the file itself."""
+    return hashlib.sha256(json.dumps(payload, indent=indent).encode("utf-8")).hexdigest()
+
+
+def file_digest(path: Path) -> str:
+    """sha256 of a file's current bytes."""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def atomic_write_json(path: Path, payload: Any, indent: int | None = 1) -> None:
@@ -23,7 +36,10 @@ def atomic_write_json(path: Path, payload: Any, indent: int | None = 1) -> None:
     file — it sees the old content or the new, nothing in between.
     """
     tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(payload, indent=indent), encoding="utf-8")
+    # newline pinned: the file's bytes must equal json.dumps(...).encode()
+    # exactly (no platform CRLF translation), so json_digest(payload) of a
+    # candidate manifest always matches file_digest() of the saved file
+    tmp.write_text(json.dumps(payload, indent=indent), encoding="utf-8", newline="\n")
     os.replace(tmp, path)
 
 

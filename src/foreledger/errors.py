@@ -49,6 +49,18 @@ class OfficialConflictError(ForecastArchiveError):
     """
 
 
+class PartialCommitError(ForecastArchiveError):
+    """A write's data committed durably and is visible, but the post-commit
+    integrity-journal confirmation failed.
+
+    The archive is not corrupt: the journal still holds the commit in its
+    staged/pending form, and the next locked write — including an exact
+    retry of this call, which is then a no-op — or the next open completes
+    the bookkeeping automatically. Raised instead of the underlying error so
+    the caller is never told a committed write failed outright.
+    """
+
+
 class ConflictLogError(ForecastArchiveError):
     """A registration committed durably, but writing its required conflict
     audit records failed afterwards.

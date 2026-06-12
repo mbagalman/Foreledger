@@ -401,7 +401,7 @@ def test_truncated_but_valid_manifest_is_detected(store: Path) -> None:
 
     # rewrite runs.json as a valid empty manifest
     (store / "runs.json").write_text('{"runs": []}', encoding="utf-8")
-    with pytest.raises(StoreFormatError, match="no longer references"):
+    with pytest.raises(StoreFormatError, match="recorded content digest|no longer references"):
         ForecastArchive(store)
     assert (store / "segment_integrity.json").read_text(encoding="utf-8") == integrity_before
 
@@ -416,10 +416,144 @@ def test_truncated_actuals_manifest_is_detected(store: Path) -> None:
     manifest_path.write_text(json.dumps(payload), encoding="utf-8")
 
     # detected on the live handle and on reopen
-    with pytest.raises(StoreFormatError, match="no longer references"):
+    with pytest.raises(StoreFormatError, match="recorded content digest|no longer references"):
         archive.accuracy_at_horizon(1, model_id="alpha", model_version="v1")
-    with pytest.raises(StoreFormatError, match="no longer references"):
+    with pytest.raises(StoreFormatError, match="recorded content digest|no longer references"):
         ForecastArchive(store)
+
+
+def _rewrite_runs_manifest(store: Path, mutate) -> None:
+    """Apply an external (out-of-commit) edit to runs.json."""
+    manifest_path = store / "runs.json"
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    mutate(payload)
+    manifest_path.write_text(json.dumps(payload, indent=1), encoding="utf-8")
+
+
+def test_selective_run_record_removal_is_detected(store: Path) -> None:
+    """Review reproduction: removing ONE run record while its segment stays
+    referenced by sibling records must still be detected — the journal binds
+    the manifest's full content, not just its segment references."""
+    archive = _populated(store)
+
+    def drop_one(payload: dict) -> None:
+        assert len(payload["runs"]) > 1
+        del payload["runs"][-1]
+
+    _rewrite_runs_manifest(store, drop_one)
+    # detected on the live handle and on reopen
+    with pytest.raises(StoreFormatError, match="recorded content digest"):
+        archive.accuracy_at_horizon(1, model_id="alpha", model_version="v1")
+    with pytest.raises(StoreFormatError, match="recorded content digest"):
+        ForecastArchive(store)
+
+
+def test_superseded_flag_mutation_is_detected(store: Path) -> None:
+    _populated(store)
+
+    def flip(payload: dict) -> None:
+        payload["runs"][0]["superseded"] = True
+
+    _rewrite_runs_manifest(store, flip)
+    with pytest.raises(StoreFormatError, match="recorded content digest"):
+        ForecastArchive(store)
+
+
+def test_run_identity_mutation_is_detected(store: Path) -> None:
+    _populated(store)
+
+    def swap_id(payload: dict) -> None:
+        payload["runs"][0]["run_id"] = "0" * 32
+
+    _rewrite_runs_manifest(store, swap_id)
+    with pytest.raises(StoreFormatError, match="recorded content digest"):
+        ForecastArchive(store)
+
+
+def test_pre_binding_journal_adopts_manifest_digests(store: Path) -> None:
+    """Format-3 stores written before digest binding lack the manifests
+    section; it is adopted on first open, after which edits are detected."""
+    _populated(store)
+    journal_path = store / "segment_integrity.json"
+    payload = json.loads(journal_path.read_text(encoding="utf-8"))
+    del payload["manifests"]
+    journal_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    reopened = ForecastArchive(store)
+    adopted = json.loads(journal_path.read_text(encoding="utf-8"))["manifests"]
+    assert adopted["runs.json"]["current"]
+    assert adopted["actuals_manifest.json"]["current"]
+    reopened.reconcile()
+
+
+def test_failed_journal_confirmation_is_partial_and_heals_on_retry(
+    store: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review reproduction: a transient failure of the post-commit journal
+    flip must be reported as a partial commit (the data IS visible), an
+    exact retry must complete the bookkeeping, and the manifest-truncation
+    protection must survive the whole episode."""
+    import foreledger.archive as archive_module
+    from foreledger import PartialCommitError
+
+    archive = ForecastArchive(store)
+    real_confirm = archive_module.confirm_commit
+    fail_once = {"armed": True}
+
+    def flaky_confirm(*args: object, **kwargs: object) -> None:
+        if fail_once["armed"]:
+            fail_once["armed"] = False
+            raise OSError("transient journal write failure")
+        real_confirm(*args, **kwargs)
+
+    monkeypatch.setattr(archive_module, "confirm_commit", flaky_confirm)
+    with pytest.raises(PartialCommitError):
+        archive.ingest(forecast_frame(1.0), model_id="alpha", model_version="v1")
+
+    # the data committed and is visible despite the reported failure
+    assert len(archive.as_of(ORIGINS[-1])) > 0
+    journal = json.loads((store / "segment_integrity.json").read_text(encoding="utf-8"))
+    assert any(not record["committed"] for record in journal["segments"].values())
+
+    # the exact retry is a no-op that heals the journal
+    result = archive.ingest(forecast_frame(1.0), model_id="alpha", model_version="v1")
+    assert result.n_runs_written == 0
+    journal = json.loads((store / "segment_integrity.json").read_text(encoding="utf-8"))
+    assert all(record["committed"] for record in journal["segments"].values())
+    assert journal["manifests"]["runs.json"]["pending"] is None
+
+    # and a truncated manifest is still corruption, not a prunable orphan
+    (store / "runs.json").write_text('{"runs": []}', encoding="utf-8")
+    with pytest.raises(StoreFormatError):
+        ForecastArchive(store)
+
+
+def test_interrupted_legacy_migration_reruns_cleanly(
+    store: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review reproduction: a legacy migration whose manifest save fails must
+    leave only a prunable staged orphan — the rerun completes and the store
+    opens; it must never strand a committed-but-unreferenced journal entry."""
+    from foreledger.ingestion import RunManifest
+
+    _write_legacy_store(store)
+    real_save = RunManifest.save
+    fail_once = {"armed": True}
+
+    def flaky_save(self: RunManifest) -> None:
+        if fail_once["armed"]:
+            fail_once["armed"] = False
+            raise OSError("disk full during migration")
+        real_save(self)
+
+    monkeypatch.setattr(RunManifest, "save", flaky_save)
+    with pytest.raises(OSError, match="disk full"):
+        ForecastArchive(store)
+
+    reopened = ForecastArchive(store)  # the rerun migrates cleanly
+    listing = reopened.list_models()
+    assert len(listing) == 1
+    reopened.reconcile()
 
 
 def test_corrupt_store_fails_writes_before_any_side_effect(store: Path) -> None:

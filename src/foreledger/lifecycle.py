@@ -29,7 +29,7 @@ from .ingestion import (
     validate_forecast_segment_token,
 )
 from .integrity import SegmentIntegrity
-from .jsonstore import atomic_write_json
+from .jsonstore import atomic_write_json, file_digest
 from .schema import FORMAT_VERSION
 
 logger = logging.getLogger("foreledger.lifecycle")
@@ -154,7 +154,18 @@ def check_or_init_store(
     if not manifest_path.exists():
         RunManifest(path=manifest_path).save()
     if not integrity_path.exists():
-        SegmentIntegrity(path=integrity_path).save()
+        # bind the just-created manifests' content into the journal from the
+        # very first moment of the store's life
+        SegmentIntegrity(
+            path=integrity_path,
+            manifests={
+                "runs.json": {"current": file_digest(manifest_path), "pending": None},
+                "actuals_manifest.json": {
+                    "current": file_digest(actuals_manifest_path),
+                    "pending": None,
+                },
+            },
+        ).save()
     write_format_version(store, FORMAT_VERSION)
     return FORMAT_VERSION
 
@@ -200,15 +211,18 @@ def migrate_to_v3(
     backend: Backend,
     integrity_path: Path,
     referenced_tokens: Sequence[str],
+    manifest_digests: dict[str, str],
 ) -> None:
     """Final migration step: adopt integrity fingerprints and bump.
 
     Every referenced segment — including superseded history, which the
     append-only promise still protects — gets a fingerprint of its current
-    content. Adoption is migration-only: once at format 3, a missing registry
-    or fingerprint is corruption, never an implicit authorization to trust
-    whatever bytes are present. The version is bumped last so an interrupted
-    migration simply reruns. Caller holds the store lock.
+    content, and the visibility manifests' content digests are recorded so
+    later selective edits to them are detectable. Adoption is migration-only:
+    once at format 3, a missing registry or fingerprint is corruption, never
+    an implicit authorization to trust whatever bytes are present. The
+    version is bumped last so an interrupted migration simply reruns. Caller
+    holds the store lock.
     """
     registry = (
         SegmentIntegrity.load(integrity_path)
@@ -225,6 +239,9 @@ def migrate_to_v3(
             registry.entries[token]["committed"] = True
     for stale in set(registry.entries) - set(tokens):
         del registry.entries[stale]
+    registry.manifests = {
+        name: {"current": digest, "pending": None} for name, digest in manifest_digests.items()
+    }
     registry.save()
     write_format_version(store, FORMAT_VERSION)
     logger.info(
@@ -238,16 +255,20 @@ def migrate_legacy_run_manifest(
     backend: Backend,
     manifest_path: Path,
     entries: list[dict[str, Any]],
-    record_integrity: Callable[[list[str]], None],
+    stage_integrity: Callable[[list[str], dict[str, Any]], None],
+    confirm_integrity: Callable[[list[str], dict[str, Any]], None],
 ) -> RunManifest:
     """Deterministically migrate per-series-set run records (pre-57930cc)
     to per-series records.
 
     Each active legacy run's rows are re-tagged with per-series run_ids in a
     new segment; the legacy segment files stay on disk (never deleted) but
-    are no longer referenced. Crash-safe: the manifest is replaced atomically
-    last, so an interrupted migration simply reruns. Caller holds the store
-    lock.
+    are no longer referenced. Crash-safe via the same staged-then-confirmed
+    journal protocol as normal ingestion: the replacement segment is staged
+    before the manifest save and confirmed after, so an interruption at any
+    point leaves either the untouched legacy manifest plus a prunable staged
+    orphan, or a completed commit — a rerun is always clean. Caller holds
+    the store lock.
     """
     legacy = [e for e in entries if "series_key" in e]
     modern = [e for e in entries if "series_key" not in e]
@@ -293,14 +314,17 @@ def migrate_legacy_run_manifest(
                     ingested_at=str(entry["ingested_at"]),
                 )
             )
+    staged: list[str] = []
     if tagged_frames:
         segment = backend.write_forecast_segment(pd.concat(tagged_frames, ignore_index=True))
         for record in migrated:
             record.segment = segment
-        record_integrity([segment])
+        staged.append(segment)
 
     manifest = RunManifest(path=manifest_path, runs=[*records, *migrated])
+    stage_integrity(staged, manifest.payload())
     manifest.save()
+    confirm_integrity(staged, manifest.payload())
     logger.info(
         "migrated %d legacy run record(s) to %d per-series record(s)",
         len(legacy),
