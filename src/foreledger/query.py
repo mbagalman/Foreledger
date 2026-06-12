@@ -86,7 +86,7 @@ def _series_list(series: str | Sequence[str] | None) -> list[str] | None:
         # beats a silent empty scope (and an empty SQL IN list is invalid on
         # some dialects)
         raise ValidationError(
-            "series lists at least one series id; pass series=None for all series"
+            "series must list at least one series id; pass series=None for all series"
         )
     if ALL_SERIES in values:
         # '*' names the pooled summary cells; accepting it here would make

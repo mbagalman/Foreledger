@@ -29,7 +29,8 @@
       "PowerShell(python examples/quickstart.py | Out-Null; \"quickstart exit=$LASTEXITCODE\"; python scripts/check_quickstart_doc.py 2>&1 | Select-Object -Last 1; python scripts/check_doc_links.py | Select-Object -Last 1)",
       "PowerShell(ruff check tests 2>&1)",
       "Bash(ruff check *)",
-      "PowerShell(ruff check . 2>&1 | Select-Object -Last 1; python examples/quickstart.py | Out-Null; \"quickstart exit=$LASTEXITCODE\"; python scripts/check_quickstart_doc.py 2>&1 | Select-Object -Last 1; python scripts/check_doc_links.py | Select-Object -Last 1; python scratch/bench_read_path.py 2>&1 | Select-Object -Last 5)"
+      "PowerShell(ruff check . 2>&1 | Select-Object -Last 1; python examples/quickstart.py | Out-Null; \"quickstart exit=$LASTEXITCODE\"; python scripts/check_quickstart_doc.py 2>&1 | Select-Object -Last 1; python scripts/check_doc_links.py | Select-Object -Last 1; python scratch/bench_read_path.py 2>&1 | Select-Object -Last 5)",
+      "PowerShell(pytest -q 2>&1 | Select-Object -Last 2; ruff check . 2>&1 | Select-Object -Last 1; ruff format --check . 2>&1 | Select-Object -Last 1; mypy src 2>&1 | Select-Object -Last 1; python -m build 2>&1 | Select-Object -Last 2; python examples/quickstart.py | Out-Null; \"quickstart exit=$LASTEXITCODE\"; python scripts/check_quickstart_doc.py 2>&1 | Select-Object -Last 1; python scripts/check_doc_links.py | Select-Object -Last 1)"
     ],
     "additionalDirectories": [
       "c:\\Users\\micha\\AppData\\Local\\Temp"
