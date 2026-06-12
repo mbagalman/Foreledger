@@ -89,9 +89,9 @@ print(curve.to_frame())
   or flagged loudly, never picked silently.
 - **Built-in metrics** (MAE, RMSE, MAPE, MASE) plus a protocol for
   registering your own — custom metrics run behind an error/timeout guard,
-  so one that crashes or hangs is skipped and quarantined rather than
-  corrupting a recompute. (Containment, not a security sandbox: registered
-  code runs in-process.)
+  so one that crashes is skipped and one that hangs is skipped and
+  quarantined for the session, rather than corrupting a recompute.
+  (Containment, not a security sandbox: registered code runs in-process.)
 - **Champion/challenger workflow** — designate a champion per model and every
   comparison reports challenger deltas automatically.
 - **Drill-down provenance** — any headline accuracy number can be exploded

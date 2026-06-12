@@ -26,7 +26,10 @@
       "PowerShell(ruff check . 2>&1 | Select-Object -Last 1; ruff format . 2>&1 | Select-Object -Last 1; mypy src 2>&1 | Select-Object -Last 1; pytest -q 2>&1 | Select-Object -Last 2; python examples/quickstart.py | Out-Null; \"quickstart exit=$LASTEXITCODE\"; python scripts/check_quickstart_doc.py 2>&1 | Select-Object -Last 1; python scripts/check_doc_links.py | Select-Object -Last 1)",
       "PowerShell(git add -A; git commit -F \"$env:TEMP\\\\foreledger_commit_msg.txt\"; git push; Start-Sleep -Seconds 20; gh run watch \\(gh run list --repo mbagalman/Foreledger --limit 1 --json databaseId --jq '.[0].databaseId'\\) --repo mbagalman/Foreledger --exit-status 2>&1 | Select-Object -Last 1; gh run list --repo mbagalman/Foreledger --limit 1)",
       "PowerShell(git add AGENTS.md; git commit -F \"$env:TEMP\\\\foreledger_commit_msg.txt\"; git push; Start-Sleep -Seconds 20; gh run watch \\(gh run list --repo mbagalman/Foreledger --limit 1 --json databaseId --jq '.[0].databaseId'\\) --repo mbagalman/Foreledger --exit-status 2>&1 | Select-Object -Last 1; gh run list --repo mbagalman/Foreledger --limit 1)",
-      "PowerShell(python examples/quickstart.py | Out-Null; \"quickstart exit=$LASTEXITCODE\"; python scripts/check_quickstart_doc.py 2>&1 | Select-Object -Last 1; python scripts/check_doc_links.py | Select-Object -Last 1)"
+      "PowerShell(python examples/quickstart.py | Out-Null; \"quickstart exit=$LASTEXITCODE\"; python scripts/check_quickstart_doc.py 2>&1 | Select-Object -Last 1; python scripts/check_doc_links.py | Select-Object -Last 1)",
+      "PowerShell(ruff check tests 2>&1)",
+      "Bash(ruff check *)",
+      "PowerShell(ruff check . 2>&1 | Select-Object -Last 1; python examples/quickstart.py | Out-Null; \"quickstart exit=$LASTEXITCODE\"; python scripts/check_quickstart_doc.py 2>&1 | Select-Object -Last 1; python scripts/check_doc_links.py | Select-Object -Last 1; python scratch/bench_read_path.py 2>&1 | Select-Object -Last 5)"
     ],
     "additionalDirectories": [
       "c:\\Users\\micha\\AppData\\Local\\Temp"

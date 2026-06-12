@@ -10,6 +10,7 @@ from __future__ import annotations
 from datetime import timedelta
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from .errors import ValidationError
@@ -27,6 +28,9 @@ from .errors import ValidationError
 FORMAT_VERSION = 3
 
 DEFAULT_SOURCE = "default"
+#: Reserved series label for pooled (all-series) summary cells. Rejected as
+#: a series_id at intake and in query scopes so the pooled cells can never
+#: collide with — or silently substitute for — a real series.
 ALL_SERIES = "*"
 ALL_PERIOD = "all"
 
@@ -73,7 +77,17 @@ SUMMARY_COLUMNS = [
 
 
 def to_timestamp(value: Any, field: str) -> pd.Timestamp:
-    """Coerce a user-supplied origin/target to a pandas Timestamp."""
+    """Coerce a user-supplied origin/target to a pandas Timestamp.
+
+    Bare numbers are rejected: pandas would silently read them as epoch
+    nanoseconds, so ``as_of(20260601)`` would become a 1970 date instead of
+    the obviously intended calendar day.
+    """
+    if isinstance(value, (bool, int, float, np.integer, np.floating)):
+        raise ValidationError(
+            f"{field} value {value!r} is a bare number; pass a datetime, date, or "
+            "ISO string (a number would be read as epoch nanoseconds)"
+        )
     try:
         ts = pd.Timestamp(value)
     except (ValueError, TypeError) as exc:

@@ -271,3 +271,20 @@ def test_nixtla_adapter_equals_explicit_ingest(tmp_path: object) -> None:
         left.sort_values(key).reset_index(drop=True),
         right.sort_values(key).reset_index(drop=True),
     )
+
+
+def test_star_series_id_is_reserved(archive: ForecastArchive) -> None:
+    """'*' names the pooled summary cells; a real series called '*' would
+    collide with them and make pooled queries ambiguous."""
+    frame = forecast_frame(1.0)
+    frame.loc[0, "series_id"] = "*"
+    with pytest.raises(ValidationError, match="reserved"):
+        archive.ingest(frame, model_id="alpha", model_version="v1")
+
+
+def test_numeric_datetime_columns_are_rejected(archive: ForecastArchive) -> None:
+    """A yyyymmdd int column would silently become 1970 epoch dates."""
+    frame = forecast_frame(1.0)
+    frame["target"] = 20260601
+    with pytest.raises(ValidationError, match="numeric"):
+        archive.ingest(frame, model_id="alpha", model_version="v1")

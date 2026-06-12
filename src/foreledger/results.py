@@ -38,7 +38,9 @@ class AccuracyResult:
         The metric value over the covered pairs, or ``None`` when
         insufficient.
     n:
-        Number of forecast/actual pairs the value covers.
+        Number of matched forecast/actual pairs in scope. A metric may be
+        undefined on some matched pairs (e.g. MAPE excludes zero actuals);
+        the value covers the defined subset, while ``n`` counts the match.
     n_missing_actuals:
         Forecast rows in scope that had no usable actual (includes targets
         marked ambiguous by an unresolved same-timestamp conflict).

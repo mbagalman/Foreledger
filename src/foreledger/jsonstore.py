@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -40,7 +41,17 @@ def atomic_write_json(path: Path, payload: Any, indent: int | None = 1) -> None:
     # exactly (no platform CRLF translation), so json_digest(payload) of a
     # candidate manifest always matches file_digest() of the saved file
     tmp.write_text(json.dumps(payload, indent=indent), encoding="utf-8", newline="\n")
-    os.replace(tmp, path)
+    # On Windows, replacing a file a lock-free reader momentarily holds open
+    # raises PermissionError; reads are milliseconds, so a brief bounded
+    # retry absorbs the race instead of failing a writer's commit spuriously.
+    for attempt in range(5):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:  # pragma: no cover - timing-dependent, Windows
+            if attempt == 4:
+                raise
+            time.sleep(0.01 * (attempt + 1))
 
 
 def file_key(path: Path) -> tuple[int, int] | None:

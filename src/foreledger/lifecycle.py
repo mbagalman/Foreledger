@@ -91,7 +91,8 @@ def stored_format_version(store: Path) -> int | None:
     try:
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
         raw = meta["format_version"]
-    except (KeyError, json.JSONDecodeError) as exc:
+    except (KeyError, TypeError, json.JSONDecodeError) as exc:
+        # TypeError: valid JSON that is not an object (e.g. a bare list)
         raise StoreFormatError(f"archive metadata at {meta_path} is unreadable or corrupt") from exc
     # strict: booleans are ints in Python, "1" is not a version
     if isinstance(raw, bool) or not isinstance(raw, int):

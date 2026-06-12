@@ -756,3 +756,93 @@ def test_malformed_legacy_record_is_a_typed_error(store: Path) -> None:
     (store / "runs.json").write_text('{"runs": [{"series_key": "x"}]}', encoding="utf-8")
     with pytest.raises(StoreFormatError, match="legacy"):
         ForecastArchive(store)
+
+
+def test_failed_actuals_confirmation_is_partial_and_heals_on_retry(
+    store: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Symmetry with the ingest case: a transient post-commit journal-flip
+    failure during register_actuals is a partial commit (the rows ARE
+    visible) and an exact replay completes the bookkeeping."""
+    import foreledger.archive as archive_module
+    from foreledger import PartialCommitError
+
+    archive = ForecastArchive(store)
+    archive.ingest(forecast_frame(1.0), model_id="alpha", model_version="v1")
+    real_confirm = archive_module.confirm_commit
+    fail_once = {"armed": True}
+
+    def flaky_confirm(*args: object, **kwargs: object) -> None:
+        if fail_once["armed"]:
+            fail_once["armed"] = False
+            raise OSError("transient journal write failure")
+        real_confirm(*args, **kwargs)
+
+    monkeypatch.setattr(archive_module, "confirm_commit", flaky_confirm)
+    with pytest.raises(PartialCommitError):
+        archive.register_actuals(actuals_frame(), recorded_at="2026-02-01")
+
+    # the rows committed and are visible despite the reported failure
+    assert len(archive._visible_actuals()) == len(actuals_frame())
+
+    # the exact replay is a no-op that heals the journal
+    archive.register_actuals(actuals_frame(), recorded_at="2026-02-01")
+    journal = json.loads((store / "segment_integrity.json").read_text(encoding="utf-8"))
+    assert all(record["committed"] for record in journal["segments"].values())
+    assert journal["manifests"]["actuals_manifest.json"]["pending"] is None
+    archive.reconcile()
+
+
+def test_failed_manifest_save_leaves_clean_retry(
+    store: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Crash window between stage and manifest save: the call fails at its
+    pre-call state (nothing visible), the staged journal entry and pending
+    digest are healed, and both retry and reopen are clean."""
+    from foreledger.ingestion import RunManifest
+
+    archive = ForecastArchive(store)
+    real_save = RunManifest.save
+    fail_once = {"armed": True}
+
+    def flaky_save(self: RunManifest) -> None:
+        if fail_once["armed"]:
+            fail_once["armed"] = False
+            raise OSError("disk full during manifest save")
+        real_save(self)
+
+    monkeypatch.setattr(RunManifest, "save", flaky_save)
+    with pytest.raises(OSError, match="disk full"):
+        archive.ingest(forecast_frame(1.0), model_id="alpha", model_version="v1")
+
+    # nothing became visible
+    assert len(archive.as_of("2100-01-01")) == 0
+
+    # the retry commits cleanly and the journal is coherent
+    result = archive.ingest(forecast_frame(1.0), model_id="alpha", model_version="v1")
+    assert result.n_runs_written > 0
+    journal = json.loads((store / "segment_integrity.json").read_text(encoding="utf-8"))
+    assert all(record["committed"] for record in journal["segments"].values())
+    assert journal["manifests"]["runs.json"]["pending"] is None
+    archive.register_actuals(actuals_frame())
+    archive.reconcile()
+
+    # and a fresh open agrees
+    reopened = ForecastArchive(store)
+    assert len(reopened.as_of("2100-01-01")) == len(forecast_frame(1.0))
+
+
+def test_non_object_metadata_is_a_typed_error(store: Path) -> None:
+    """Valid JSON that is not an object must be typed corruption, not a raw
+    TypeError escaping the format gate."""
+    ForecastArchive(store)
+    (store / "archive_meta.json").write_text("[1]", encoding="utf-8")
+    with pytest.raises(StoreFormatError):
+        ForecastArchive(store)
+
+
+def test_corrupt_champions_file_is_a_typed_error(store: Path) -> None:
+    archive = ForecastArchive(store)
+    (store / "champions.json").write_text("[]", encoding="utf-8")
+    with pytest.raises(StoreFormatError):
+        archive.champions()

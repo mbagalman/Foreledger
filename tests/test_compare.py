@@ -84,3 +84,44 @@ def test_comparison_over_common_scope(populated: ForecastArchive) -> None:
             1, model_id=row["model_id"], model_version=row["model_version"], series="S1"
         )
         assert row["value"] == single.value
+
+
+def test_compare_curve_default_horizons_scope_to_listed_models(
+    populated: ForecastArchive,
+) -> None:
+    """An unrelated model's extra horizons must not inject all-insufficient
+    rows into a comparison between other models."""
+    from tests.conftest import ORIGINS
+
+    far = pd.DataFrame(
+        {
+            "series_id": ["S1"],
+            "target": [ORIGINS[0] + pd.Timedelta(days=9)],
+            "value": [100.0],
+        }
+    )
+    populated.ingest(far, model_id="gamma", model_version="v1", origin=ORIGINS[0])
+
+    frame = populated.compare_curve(ALL_MODELS, metric="MAE")
+    assert set(frame["horizon"]) == set(HORIZONS)  # no horizon-9 rows
+
+
+def test_malformed_comparison_inputs_raise_typed_errors(populated: ForecastArchive) -> None:
+    from foreledger import ValidationError
+
+    with pytest.raises(ValidationError):
+        populated.compare_models(1, [("a", "b", "c")])  # not a pair
+    with pytest.raises(ValidationError):
+        populated.compare_models(1, ["alpha"])  # bare string entry
+    with pytest.raises(ValidationError):
+        populated.compare_models(1, [])
+    # a 2-element LIST as champion previously built a garbage map from the
+    # strings' characters — silently wrong champions
+    with pytest.raises(ValidationError):
+        populated.compare_models(1, [("alpha", "v1")], champion=["alpha", "v1"])
+
+
+def test_compare_curve_empty_scope_keeps_schema(populated: ForecastArchive) -> None:
+    frame = populated.compare_curve([("nobody", "v0")], metric="MAE")
+    assert frame.empty
+    assert "model_id" in frame.columns and "delta_vs_champion" in frame.columns

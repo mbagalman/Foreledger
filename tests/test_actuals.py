@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
-from tests.conftest import ORIGINS, forecast_frame
+from tests.conftest import ORIGINS, actuals_frame, forecast_frame
 
 from foreledger import ForecastArchive, OfficialConflictError, ValidationError
 
@@ -515,3 +515,10 @@ def test_failed_designation_append_leaves_nothing_visible(
     archive.register_actuals(one_target_frame(100.0), source="rev1", official=True, recorded_at=ts)
     assert mae_at_h1(archive, basis="official").status == "ok"
     archive.reconcile()
+
+
+def test_star_series_id_is_reserved_for_actuals(archive: ForecastArchive) -> None:
+    frame = actuals_frame()
+    frame.loc[0, "series_id"] = "*"
+    with pytest.raises(ValidationError, match="reserved"):
+        archive.register_actuals(frame)

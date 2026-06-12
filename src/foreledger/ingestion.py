@@ -31,7 +31,7 @@ import pandas as pd
 
 from .errors import ValidationError
 from .jsonstore import atomic_write_json
-from .schema import compute_horizon, to_timestamp
+from .schema import ALL_SERIES, compute_horizon, to_timestamp
 
 logger = logging.getLogger("foreledger.ingestion")
 
@@ -144,7 +144,16 @@ class RunManifest:
 
 
 def normalize_datetimes(series: pd.Series, field_name: str) -> pd.Series:
-    """Coerce a column to naive pandas datetimes."""
+    """Coerce a column to naive pandas datetimes.
+
+    Numeric columns are rejected: pandas would silently read them as epoch
+    timestamps, turning a ``20260601``-style date column into 1970 dates.
+    """
+    if pd.api.types.is_numeric_dtype(series):
+        raise ValidationError(
+            f"column for {field_name!r} is numeric; datetimes are required "
+            "(numbers would be read as epoch timestamps)"
+        )
     try:
         converted = pd.to_datetime(series)
     except (ValueError, TypeError) as exc:
@@ -172,13 +181,19 @@ def validate_series_ids(raw: pd.Series, frame_kind: str) -> pd.Series:
     """Coerce series identifiers to non-empty strings; reject missing/blank.
 
     Untrusted input: without this check ``astype(str)`` would mint phantom
-    series named ``"nan"``/``"None"`` into the permanent archive.
+    series named ``"nan"``/``"None"`` into the permanent archive. The label
+    ``"*"`` is reserved for the summary's pooled all-series cells — a real
+    series named ``"*"`` would collide with them and make queries ambiguous.
     """
     if raw.isna().any():
         raise ValidationError(f"{frame_kind} series_id column contains missing values")
     as_str = raw.astype(str).str.strip()
     if (as_str == "").any():
         raise ValidationError(f"{frame_kind} series_id column contains blank identifiers")
+    if (as_str == ALL_SERIES).any():
+        raise ValidationError(
+            f"{frame_kind} series_id {ALL_SERIES!r} is reserved for pooled summary cells"
+        )
     return as_str
 
 
@@ -360,7 +375,11 @@ def commit_runs(
     ``manifest`` is never mutated: a candidate manifest is built and saved,
     and returned only after the save succeeds. If anything raises, the caller
     keeps its committed view — no uncommitted rows ever become visible on the
-    live object.
+    live object. A failure before the manifest save leaves at most an
+    invisible segment file (never scanned — reads use only manifest-listed
+    segments) and a staged journal entry the next heal prunes; the file
+    itself is retained because storage tokens are backend-defined and
+    failed-write debris is rare and inert.
     """
     new_records: list[RunRecord] = []
     tagged_frames: list[pd.DataFrame] = []

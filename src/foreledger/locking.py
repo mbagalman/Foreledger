@@ -7,9 +7,12 @@ from a stale snapshot and silently erase the other's entries. Every such
 update happens while holding this lock, and re-reads the file inside it.
 
 The lock is an OS-level byte lock on a dedicated file, so it works across
-processes and between two handles in one process. It is not reentrant: only
-the public write methods of ``ForecastArchive`` acquire it, never the helpers
-they call.
+processes and between two handles in one process. It is not reentrant:
+acquisition sites in ``ForecastArchive`` (constructor init/migrations, the
+public write commits, summary publication, the snapshot capture fallback)
+are mutually exclusive by construction — a helper that needs the lock is
+never called while it is held, which is why post-commit summary refreshes
+run only after the write releases it.
 """
 
 from __future__ import annotations

@@ -126,21 +126,27 @@ class DuckDBBackend(Backend):
         # the cleanup below can therefore never race another writer's
         # about-to-be-published generation.)
         name = f"summary-{uuid.uuid4().hex}.parquet"
-        self._atomic_write(frame, self.summary_dir / name)
-        digest = hashlib.sha256((self.summary_dir / name).read_bytes()).hexdigest()
+        path = self.summary_dir / name
         try:
+            self._atomic_write(frame, path)
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
             atomic_write_json(
                 self.summary_dir / "summary_meta.json",
                 {"state_token": state_token, "data": name, "sha256": digest},
                 indent=None,
             )
         except BaseException:
-            # the generation was never published: remove it so repeated
-            # refresh failures cannot accumulate orphaned summary files
-            with contextlib.suppress(OSError):
-                (self.summary_dir / name).unlink()
+            # nothing was published: remove this attempt's data file AND its
+            # temp file so repeated tolerated refresh failures (the boundary
+            # this cache is designed to survive) cannot accumulate orphans
+            for leftover in (path, path.with_suffix(".parquet.tmp")):
+                with contextlib.suppress(OSError):
+                    leftover.unlink()
             raise
-        for stale in self.summary_dir.glob("summary*.parquet"):
+        for stale in (
+            *self.summary_dir.glob("summary*.parquet"),
+            *self.summary_dir.glob("summary*.parquet.tmp"),  # crash leftovers
+        ):
             if stale.name != name:
                 # best-effort: a reader holding the old generation open keeps
                 # its file alive (Windows) — the next replacement sweeps it; a

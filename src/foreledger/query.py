@@ -43,6 +43,21 @@ from .summary import metric_over_pairs
 
 Period = tuple[Any, Any] | None
 
+#: Column contract of the comparison frames (compare_models / compare_curve).
+_COMPARE_COLUMNS = [
+    "model_id",
+    "model_version",
+    "horizon",
+    "metric",
+    "basis",
+    "status",
+    "value",
+    "n",
+    "champion_version",
+    "is_champion",
+    "delta_vs_champion",
+]
+
 
 def _parse_period(period: Period) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
     if period is None:
@@ -60,8 +75,45 @@ def _series_list(series: str | Sequence[str] | None) -> list[str] | None:
     if series is None:
         return None
     if isinstance(series, str):
-        return [series]
-    return [str(s) for s in series]
+        values = [series]
+    else:
+        try:
+            values = [str(s) for s in series]
+        except TypeError as exc:
+            raise ValidationError("series must be a string or an iterable of strings") from exc
+    if ALL_SERIES in values:
+        # '*' names the pooled summary cells; accepting it here would make
+        # the summary route answer "all series pooled" while the raw route
+        # filters for a literal series named '*' — silent divergence
+        raise ValidationError(
+            "series '*' is reserved for pooled summary cells; pass series=None to query all series"
+        )
+    return values
+
+
+def _validate_horizon(value: Any) -> int:
+    """Horizons are whole days; reject silent truncation (7.5 -> 7) and
+    string digits masquerading as numbers."""
+    if isinstance(value, bool):
+        raise ValidationError("horizon must be an integer number of days")
+    try:
+        as_int = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValidationError(f"horizon {value!r} is not an integer number of days") from exc
+    if as_int != value:
+        raise ValidationError(f"horizon {value!r} is not a whole number of days")
+    return as_int
+
+
+def _validate_models(models: Sequence[tuple[str, str]]) -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    for entry in models:
+        if isinstance(entry, str) or not isinstance(entry, Sequence) or len(entry) != 2:
+            raise ValidationError("models must be (model_id, model_version) pairs")
+        pairs.append((str(entry[0]), str(entry[1])))
+    if not pairs:
+        raise ValidationError("models must list at least one (model_id, model_version)")
+    return pairs
 
 
 def _coverage_status(usable: bool, n_missing: int) -> Literal["ok", "partial", "insufficient"]:
@@ -156,6 +208,7 @@ class Evaluator:
         horizon: int | None = None,
         model_id: str | None = None,
         model_version: str | None = None,
+        models: Sequence[tuple[str, str]] | None = None,
         series: str | Sequence[str] | None = None,
         period: Period = None,
         origin_max: pd.Timestamp | None = None,
@@ -168,6 +221,7 @@ class Evaluator:
             segments=snap.segments,
             model_id=model_id,
             model_version=model_version,
+            models=models,
             series=_series_list(series),
             horizon=horizon,
             origin_min=start,
@@ -318,6 +372,8 @@ class Evaluator:
         single model/version, single-or-all series); anything else — and any
         summary miss — computes from raw, invisibly."""
         self._registry.get(metric)  # raises UnknownMetricError early
+        h = _validate_horizon(h)
+        _series_list(series)  # validate (incl. the reserved '*') on BOTH routes
         summary_servable = (
             fallback is None
             and period is None
@@ -356,12 +412,18 @@ class Evaluator:
         *,
         model_id: str | None = None,
         model_version: str | None = None,
+        models: Sequence[tuple[str, str]] | None = None,
         series: str | Sequence[str] | None = None,
         period: Period = None,
     ) -> list[int]:
         """The sorted distinct horizons present in the scoped forecasts."""
         forecasts = self._read_forecasts(
-            snap, model_id=model_id, model_version=model_version, series=series, period=period
+            snap,
+            model_id=model_id,
+            model_version=model_version,
+            models=models,
+            series=series,
+            period=period,
         )
         return sorted(int(h) for h in forecasts["horizon"].unique())
 
@@ -430,9 +492,16 @@ class Evaluator:
         if isinstance(override, tuple):
             if len(override) != 2:
                 raise ValidationError("champion must be a (model_id, model_version) pair")
-            champions[override[0]] = override[1]
+            champions[str(override[0])] = str(override[1])
+        elif isinstance(override, Mapping):
+            champions.update({str(k): str(v) for k, v in override.items()})
         else:
-            champions.update(dict(override))
+            # a 2-element list would otherwise build a garbage dict from the
+            # strings' characters — silently wrong champions, never an error
+            raise ValidationError(
+                "champion must be a (model_id, model_version) tuple or a "
+                "{model_id: model_version} mapping"
+            )
         return champions
 
     # -- public operations ---------------------------------------------------
@@ -497,6 +566,8 @@ class Evaluator:
             horizons = self._horizons(
                 snap, model_id=model_id, model_version=model_version, series=series, period=period
             )
+        else:
+            horizons = [_validate_horizon(h) for h in horizons]
         points = tuple(
             self._accuracy(
                 snap,
@@ -527,13 +598,12 @@ class Evaluator:
         """The metric per listed (model_id, model_version) at horizon ``h``
         over a common scope; each value equals the scoped single-model call.
         Versions whose model has a champion get a delta vs. that champion."""
-        if not models:
-            raise ValidationError("models must list at least one (model_id, model_version)")
+        pairs = _validate_models(models)
         snap = self._snapshot()
         rows = self._compare_at(
             snap,
             h,
-            models,
+            pairs,
             self._champion_map(champion),
             metric=metric,
             basis=basis,
@@ -556,11 +626,14 @@ class Evaluator:
     ) -> pd.DataFrame:
         """One accuracy-vs-horizon curve per listed model/version (long form);
         each equals the scoped ``accuracy_curve``."""
-        if not models:
-            raise ValidationError("models must list at least one (model_id, model_version)")
+        pairs = _validate_models(models)
         snap = self._snapshot()
         if horizons is None:
-            horizons = self._horizons(snap, series=series, period=period)
+            # scoped to the LISTED models: an unrelated model's extra
+            # horizons must not inject all-insufficient rows into this curve
+            horizons = self._horizons(snap, models=pairs, series=series, period=period)
+        else:
+            horizons = [_validate_horizon(h) for h in horizons]
         champions = self._champion_map(champion)
         rows: list[dict[str, Any]] = []
         for h in horizons:
@@ -568,7 +641,7 @@ class Evaluator:
                 self._compare_at(
                     snap,
                     h,
-                    models,
+                    pairs,
                     champions,
                     metric=metric,
                     basis=basis,
@@ -578,7 +651,7 @@ class Evaluator:
                 )
             )
         if not rows:
-            return pd.DataFrame()
+            return pd.DataFrame(columns=_COMPARE_COLUMNS)
         return pd.DataFrame(rows)
 
     def as_of(
@@ -616,7 +689,7 @@ class Evaluator:
         snap = self._snapshot()
         forecasts = self._read_forecasts(
             snap,
-            horizon=int(cell["horizon"]),
+            horizon=_validate_horizon(cell["horizon"]),
             model_id=str(cell["model_id"]),
             model_version=str(cell["model_version"]),
             series=series,

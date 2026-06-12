@@ -159,10 +159,23 @@ class MetricRegistry:
     def token_components(self) -> list[str]:
         """Identity strings for the summarizable metric set, including each
         implementation's fingerprint — replacing a metric under the same name
-        must invalidate any summary computed with the old implementation."""
-        return [
+        must invalidate any summary computed with the old implementation.
+
+        Quarantine state participates too: once a summarizable metric is
+        quarantined, every evaluation of it returns ``None``, so a summary
+        built before the quarantine would silently disagree with raw (and
+        make ``reconcile()`` raise on a healthy store) if it kept serving.
+        Including the quarantined names invalidates that summary instead.
+        """
+        components = [
             f"metric:{m.name}:{m.fingerprint}" for m in self._metrics.values() if m.summarizable
         ]
+        components.extend(
+            f"quarantined:{name}"
+            for name in sorted(self._quarantined)
+            if name in self._metrics and self._metrics[name].summarizable
+        )
+        return components
 
     def evaluate(
         self,

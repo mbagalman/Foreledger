@@ -159,9 +159,12 @@ class ForecastArchive:
         )
 
     def _lock(self) -> StoreLock:
-        """The cross-process lock serializing all read-modify-replace metadata
-        updates (manifest, champions, conflict bookkeeping). Acquired only by
-        the public write methods — helpers never re-acquire it."""
+        """The cross-process lock serializing every store mutation: the
+        constructor's init/migration block, the public write methods'
+        commits, summary publication (:meth:`_publish_summary`), and the
+        snapshot capture's contention fallback. It is NOT reentrant — none
+        of these may run while another is held on the same handle, which is
+        why the write methods refresh the summary only after releasing it."""
         return StoreLock(self.store / ".foreledger.lock")
 
     # -- store lifecycle (delegates to foreledger.lifecycle) -----------------
@@ -605,7 +608,14 @@ class ForecastArchive:
         """The persisted champion version per model_id."""
         if not self._champions_path.exists():
             return {}
-        loaded = json.loads(self._champions_path.read_text(encoding="utf-8"))
+        try:
+            loaded = json.loads(self._champions_path.read_text(encoding="utf-8"))
+            if not isinstance(loaded, dict):
+                raise TypeError("champions payload is not an object")
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise StoreFormatError(
+                f"champions file at {self._champions_path} is unreadable or corrupt"
+            ) from exc
         return {str(k): str(v) for k, v in loaded.items()}
 
     def register_metric(self, name: str, fn: MetricFn, summarizable: bool = True) -> None:
@@ -853,13 +863,12 @@ class ForecastArchive:
             # Maybe a benign race rather than corruption: a concurrent writer
             # flips an entry to committed only AFTER its manifest save, so a
             # fresh manifest read must reference it. Only a persistent orphan
-            # is a truncated/tampered manifest.
-            self._manifest = RunManifest.load(self._manifest_path)
-            self._manifest_digest = file_digest(self._manifest_path)
-            self._manifest_key = self._manifest_file_key()
-            self._actuals_manifest = ActualsManifest.load(self._actuals_manifest_path)
-            self._actuals_digest = file_digest(self._actuals_manifest_path)
-            self._actuals_key = self._actuals_manifest_file_key()
+            # is a truncated/tampered manifest. Reload through the coherent
+            # accessors (invalidate, then re-read): hand-assembling the
+            # (manifest, key, digest) triple here could interleave with yet
+            # another commit and poison the freshness caches.
+            self._manifest_key = None
+            self._actuals_key = None
             referenced_set = set(self._referenced_tokens())
             orphaned = [token for token in orphaned if token not in referenced_set]
         if orphaned:
@@ -908,10 +917,17 @@ class ForecastArchive:
         Computed from one evaluation snapshot (so the frame and its validity
         token always describe the same state) and published under the store
         lock only if that snapshot is still the current state — see
-        :meth:`_publish_summary`."""
-        snap = self._evaluation_snapshot()
-        frame = self._recompute_summary_from(snap)
-        self._publish_summary(frame, snap.summary_token)
+        :meth:`_publish_summary`. A discarded publication retries from a
+        fresh snapshot a couple of times: the state can move not only via a
+        concurrent commit but also via this very recompute (a metric timing
+        out mid-build quarantines itself, which changes the token), and the
+        retry converges because the second pass computes under the new state.
+        """
+        for _ in range(3):
+            snap = self._evaluation_snapshot()
+            frame = self._recompute_summary_from(snap)
+            if self._publish_summary(frame, snap.summary_token):
+                return
 
     def _refresh_summary_after_write(self) -> None:
         """Eagerly refresh the summary after a raw write, without letting a
@@ -920,10 +936,15 @@ class ForecastArchive:
         If the rebuild fails, the stored summary's token no longer matches the
         raw state, so it is never served — queries fall back to raw, and the
         next write or idempotent replay repairs it.
+
+        The validity check is inside the same boundary as the rebuild: it,
+        too, runs after the durable commit, and a failure there (corruption
+        surfacing post-commit, manifest churn) must not make a committed
+        write report plain failure — the next read raises the real error.
         """
-        if self._valid_summary() is not None:
-            return
         try:
+            if self._valid_summary() is not None:
+                return
             self.rebuild_summary()
         except Exception:
             logger.warning(
@@ -943,8 +964,14 @@ class ForecastArchive:
         committed segment (queries only probe size/mtime).
         """
         self._verify_committed_segments()
+        # manifests BEFORE journal: a writer journals before its manifest
+        # save, so a journal read taken after the manifest read is always a
+        # superset of what the manifest references — the reverse order could
+        # read a concurrent commit's manifest with a pre-commit journal and
+        # raise a false corruption alarm
+        referenced = self._referenced_tokens()
         registry = self._current_journal()
-        for token in self._referenced_tokens():
+        for token in referenced:
             record = registry.entries.get(token)
             fingerprint = self._backend.fingerprint_segment(token)
             if record is None or fingerprint["sha256"] != record["sha256"]:
@@ -1200,7 +1227,10 @@ class ForecastArchive:
         ``horizon``; ``basis`` defaults to ``"latest"`` and ``series_id`` to
         all series. Recomputing the cell's metric over the returned rows
         reproduces the summary value exactly — the drill-down is the audit
-        trail for any headline number.
+        trail for any headline number. (For pooled multi-series MASE cells,
+        "the metric" means the series-aware form: the naive-error
+        denominator excludes cross-series differences, exactly as the
+        summary computes it.)
         """
         return self._evaluator.drill(summary_cell)
 

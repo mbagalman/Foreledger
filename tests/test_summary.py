@@ -430,3 +430,86 @@ def test_summary_incompatible_dtype_falls_back_to_raw(populated: ForecastArchive
     result = populated.accuracy_at_horizon(1, model_id="alpha", model_version="v1")
     assert result.served_from == "raw"
     assert result.value == expected.value
+
+
+def test_quarantine_after_successful_build_stays_consistent(tmp_path: object) -> None:
+    """A metric that builds its summary cells successfully and is quarantined
+    LATER (timing out on a raw-routed query) must not leave the routes
+    diverging: quarantine state is part of the summary validity token, so the
+    pre-quarantine summary is invalidated, exact-cell queries agree with raw
+    (insufficient), and reconcile() does not raise on a healthy store."""
+    from pathlib import Path
+
+    from tests.conftest import ORIGINS
+
+    archive = ForecastArchive(Path(str(tmp_path)) / "store", metric_timeout=0.2)
+    archive.ingest(forecast_frame(1.0), model_id="alpha", model_version="v1")
+    archive.register_actuals(actuals_frame())
+
+    hang = {"on": False}
+
+    def flaky(forecast: FloatArray, actual: FloatArray) -> float:
+        if hang["on"]:
+            time.sleep(1.0)
+        return float(np.mean(np.abs(forecast - actual)))
+
+    archive.register_metric("Flaky", flaky, summarizable=True)
+    served = archive.accuracy_at_horizon(1, metric="Flaky", model_id="alpha", model_version="v1")
+    assert served.served_from == "summary"
+    assert served.status == "ok"
+
+    # the metric starts hanging; a raw-routed (period-scoped) query
+    # quarantines it for the session
+    hang["on"] = True
+    raw = archive.accuracy_at_horizon(
+        1,
+        metric="Flaky",
+        model_id="alpha",
+        model_version="v1",
+        period=(ORIGINS[0], ORIGINS[-1]),
+    )
+    assert raw.status == "insufficient"
+
+    # the exact-cell query must NOT keep serving the pre-quarantine number
+    after = archive.accuracy_at_horizon(1, metric="Flaky", model_id="alpha", model_version="v1")
+    assert after.status == "insufficient"
+    # no false corruption alarm from a feature working as designed
+    archive.reconcile()
+    # built-ins unaffected
+    assert (
+        archive.accuracy_at_horizon(1, metric="MAE", model_id="alpha", model_version="v1").status
+        == "ok"
+    )
+
+
+def test_post_commit_validity_check_failure_does_not_fail_the_write(
+    populated: ForecastArchive, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The summary-refresh boundary covers the validity check too: a failure
+    there happens AFTER the durable commit and must not make a committed
+    write report plain failure."""
+
+    def boom() -> pd.DataFrame | None:
+        raise RuntimeError("validity check failure after commit")
+
+    monkeypatch.setattr(populated, "_valid_summary", boom)
+    result = populated.ingest(forecast_frame(0.5), model_id="alpha", model_version="vNew")
+    assert result.n_runs_written > 0
+
+
+def test_failed_summary_data_write_leaves_no_tmp_files(
+    populated: ForecastArchive, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failing generation data write must clean up its own temp file —
+    repeated tolerated refresh failures cannot accumulate orphans."""
+    from pathlib import Path
+
+    def failing_atomic(frame: pd.DataFrame, path: Path) -> None:
+        path.with_suffix(".parquet.tmp").write_bytes(b"partial")
+        raise OSError("simulated ENOSPC")
+
+    monkeypatch.setattr(populated._backend, "_atomic_write", failing_atomic)
+    for _ in range(3):
+        with pytest.raises(OSError, match="ENOSPC"):
+            populated.rebuild_summary()
+    assert not list((populated.store / "summary").glob("*.tmp"))

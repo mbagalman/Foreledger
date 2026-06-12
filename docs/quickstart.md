@@ -341,7 +341,7 @@ forecast_ledger/
 ├── summary/              # disposable accuracy cache (immutable generations + pointer)
 ├── runs.json             # run manifest (identity, visibility, idempotency)
 ├── actuals_manifest.json # actuals/officials visibility (transactional commit)
-├── segment_integrity.json# size/mtime/sha256 per committed segment (tamper check)
+├── segment_integrity.json# commit journal: per-segment fingerprints + manifest digests
 ├── champions.json        # champion per model_id
 ├── conflicts_logged.json # dedup marker for conflicts already in the error log
 ├── error_log.txt         # unresolved actuals conflicts (created on demand)

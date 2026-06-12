@@ -170,3 +170,31 @@ def test_builtin_metrics_all_compute(populated: ForecastArchive) -> None:
         )
         assert result.status == "ok", metric
         assert result.value is not None and result.value > 0
+
+
+def test_query_inputs_are_validated(populated: ForecastArchive) -> None:
+    """Self-review hardening: malformed scopes raise typed errors instead of
+    silently truncating, diverging, or crashing in pandas."""
+    from foreledger import ValidationError
+
+    # '*' is reserved: the summary route would read it as "all series
+    # pooled" while the raw route filtered a literal series named '*'
+    with pytest.raises(ValidationError, match="reserved"):
+        populated.accuracy_at_horizon(1, series="*", model_id="alpha", model_version="v1")
+    with pytest.raises(ValidationError, match="reserved"):
+        populated.accuracy_at_horizon(1, series=["S1", "*"])
+    # horizons are whole days, never silently truncated
+    with pytest.raises(ValidationError):
+        populated.accuracy_at_horizon(7.5, model_id="alpha", model_version="v1")
+    with pytest.raises(ValidationError):
+        populated.accuracy_curve(horizons="12", model_id="alpha", model_version="v1")
+    # scalar non-string series
+    with pytest.raises(ValidationError):
+        populated.accuracy_at_horizon(1, series=123)
+    # bare numbers are not datetimes (would be read as epoch nanoseconds)
+    with pytest.raises(ValidationError, match="bare number"):
+        populated.as_of(20260601)
+    with pytest.raises(ValidationError, match="bare number"):
+        populated.accuracy_at_horizon(
+            1, model_id="alpha", model_version="v1", period=(20260101, 20260301)
+        )
