@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
-from tests.conftest import ORIGINS, actuals_frame, forecast_frame
+from tests.conftest import ORIGINS, actuals_frame, forecast_frame, summary_data_file
 
 from foreledger import ForecastArchive, StoreFormatError, ValidationError
 
@@ -331,7 +331,7 @@ def test_unmanifested_forecast_file_is_invisible(store: Path) -> None:
 
     assert len(archive.as_of("2100-01-01")) == rows_before
     raw_view = ForecastArchive(store)
-    (raw_view.store / "summary" / "summary.parquet").unlink()
+    summary_data_file(raw_view).unlink()
     raw = raw_view.accuracy_at_horizon(1, model_id="alpha", model_version="v1")
     assert raw.served_from == "raw"
     assert raw.n == baseline.n  # the stray file inflated nothing

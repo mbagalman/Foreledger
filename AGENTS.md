@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Foreledger (working name during design: "Production Forecast Archive") — a Python library that ingests recurring forecast runs from multiple models and versions (including parallel runs), stores them as a durable append-only Parquet archive alongside a revisable actuals log, behind a dialect-aware, warehouse-ready DuckDB backend seam, and answers horizon-keyed accuracy (on a `latest`/`official` basis), cross-model/version comparison (optionally vs. a champion), and bitemporal `as_of` queries over the user's own data.
+Foreledger (working name during design: "Production Forecast Archive") — a Python library that ingests recurring forecast runs from multiple models and versions (including parallel runs), stores them as a durable append-only Parquet archive alongside a revisable actuals log, behind a dialect-aware, warehouse-ready DuckDB backend seam, and answers horizon-keyed accuracy (on a `latest`/`official` basis), cross-model/version comparison (optionally vs. a champion), and origin-scoped `as_of` queries over the user's own data (full transaction-time/actual-vintage "bitemporal" querying is a future surface; `ingested_at` and actuals revision history are retained for it).
 
 ## Tooling and versions
 

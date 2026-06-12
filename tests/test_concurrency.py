@@ -206,3 +206,61 @@ def test_summary_replacement_holds_the_store_lock(
     monkeypatch.setattr(archive._backend, "replace_summary", probing_replace)
     archive.rebuild_summary()
     assert probed["locked"]
+
+
+def test_reader_never_pairs_old_token_with_new_summary_data(
+    store: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review reproduction: a summary replacement landing between a reader's
+    metadata read and its data read must never let the reader pair the old
+    validity token with the new data. With generation publication the single
+    metadata read pins an immutable data file, so the reader gets the old
+    coherent pair — or, if cleanup already removed that generation, no cache
+    at all and a raw fallback from its own snapshot. Either way the answer
+    is entirely the snapshot's state."""
+    import pandas as pd
+
+    import foreledger.backend.duckdb_backend as backend_module
+
+    handle_a = ForecastArchive(store)
+    forecasts = pd.DataFrame(
+        {
+            "series_id": ["s1", "s1"],
+            "target": pd.to_datetime(["2026-01-02", "2026-01-03"]),
+            "value": [10.0, 10.0],
+        }
+    )
+    handle_a.ingest(forecasts, model_id="alpha", model_version="v1", origin="2026-01-01")
+    first_actual = pd.DataFrame(
+        {"series_id": ["s1"], "target": pd.to_datetime(["2026-01-02"]), "value": [9.0]}
+    )
+    handle_a.register_actuals(first_actual, recorded_at="2026-01-10")
+
+    handle_b = ForecastArchive(store)
+    revision = pd.DataFrame(
+        {
+            "series_id": ["s1", "s1"],
+            "target": pd.to_datetime(["2026-01-02", "2026-01-03"]),
+            "value": [10.0, 9.0],  # h1 error becomes 0.0; h2 becomes scorable
+        }
+    )
+
+    # interleave: B commits + republishes the summary AFTER A has read the
+    # summary metadata and BEFORE A reads the summary data file
+    real_read_parquet = backend_module.pd.read_parquet
+    fired = {"done": False}
+
+    def interleaved(path, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if not fired["done"] and "summary" in str(path):
+            fired["done"] = True
+            handle_b.register_actuals(revision, recorded_at="2026-01-20")
+        return real_read_parquet(path, *args, **kwargs)
+
+    monkeypatch.setattr(backend_module.pd, "read_parquet", interleaved)
+    curve = handle_a.accuracy_curve(
+        metric="MAE", model_id="alpha", model_version="v1", horizons=[1, 2]
+    )
+    assert fired["done"]
+    # entirely the BEFORE state — never the new data blessed by the old token
+    assert curve.points[0].value == 1.0
+    assert curve.points[1].status == "insufficient"

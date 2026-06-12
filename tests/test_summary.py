@@ -7,7 +7,7 @@ import time
 import numpy as np
 import pandas as pd
 import pytest
-from tests.conftest import actuals_frame, forecast_frame
+from tests.conftest import actuals_frame, forecast_frame, summary_data_file
 
 from foreledger import ForecastArchive, ReconciliationError, ValidationError
 from foreledger.metrics import FloatArray
@@ -240,7 +240,7 @@ def test_reregistered_closure_metric_never_serves_old_capture(
 
 def test_corrupt_summary_file_falls_back_to_raw(populated: ForecastArchive) -> None:
     expected = populated.accuracy_at_horizon(1, model_id="alpha", model_version="v1")
-    (populated.store / "summary" / "summary.parquet").write_bytes(b"not parquet at all")
+    summary_data_file(populated).write_bytes(b"not parquet at all")
 
     # the disposable cache is treated as absent, never as a query error
     result = populated.accuracy_at_horizon(1, model_id="alpha", model_version="v1")
@@ -294,7 +294,7 @@ def test_summary_is_never_authoritative_over_raw(populated: ForecastArchive) -> 
 
 
 def test_summary_parquet_is_disposable(populated: ForecastArchive) -> None:
-    (populated.store / "summary" / "summary.parquet").unlink()
+    summary_data_file(populated).unlink()
     result = populated.accuracy_at_horizon(2, model_id="beta", model_version="v1")
     assert result.status == "ok"
     assert result.served_from == "raw"

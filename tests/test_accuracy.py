@@ -6,7 +6,7 @@ import dataclasses
 
 import numpy as np
 import pytest
-from tests.conftest import HORIZONS, MODELS, ORIGINS, SERIES, reference_mae
+from tests.conftest import HORIZONS, MODELS, ORIGINS, SERIES, reference_mae, summary_data_file
 
 from foreledger import ForecastArchive
 
@@ -28,7 +28,7 @@ def test_summary_route_equals_raw_route(populated: ForecastArchive) -> None:
     assert served_summary.served_from == "summary"
 
     # delete the disposable summary: the raw fallback must be invisible and equal
-    summary_file = populated.store / "summary" / "summary.parquet"
+    summary_file = summary_data_file(populated)
     summary_file.unlink()
     served_raw = populated.accuracy_at_horizon(2, **kwargs)
     assert served_raw.served_from == "raw"
@@ -64,7 +64,7 @@ def test_official_basis_summary_and_raw_agree(populated: ForecastArchive) -> Non
     # partial official coverage must be visible, not read as complete
     assert result.status == "partial"
     assert result.n_missing_actuals > 0
-    summary_file = populated.store / "summary" / "summary.parquet"
+    summary_file = summary_data_file(populated)
     summary_file.unlink()
     raw = populated.accuracy_at_horizon(1, basis="official", model_id="beta", model_version="v1")
     assert raw.served_from == "raw"
@@ -87,7 +87,7 @@ def test_routes_report_identical_results_under_partial_coverage(
     assert summary_res.status == "partial"  # gaps are explicit, never an "ok"
     assert summary_res.n_missing_actuals > 0
 
-    (populated.store / "summary" / "summary.parquet").unlink()
+    summary_data_file(populated).unlink()
     raw_res = populated.accuracy_at_horizon(5, **kwargs)
     assert raw_res.served_from == "raw"
     assert dataclasses.replace(raw_res, served_from="summary") == summary_res

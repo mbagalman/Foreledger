@@ -92,6 +92,16 @@ def populated(archive: ForecastArchive) -> ForecastArchive:
     return archive
 
 
+def summary_data_file(archive: ForecastArchive) -> Path:
+    """The current summary generation's data file (the cache publishes each
+    rebuild under a fresh immutable name; the metadata names it)."""
+    import json
+
+    meta_path = archive.store / "summary" / "summary_meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    return archive.store / "summary" / meta.get("data", "summary.parquet")
+
+
 def reference_mae(bias: float, horizon: int) -> float:
     """Hand-written reference: MAE at a horizon for one model over the fixture."""
     errors = []

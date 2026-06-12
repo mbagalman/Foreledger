@@ -336,7 +336,7 @@ forecast_ledger/
 ├── forecasts/*.parquet   # the raw ledger, one file per ingest call
 ├── actuals/*.parquet     # the revisable actuals log
 ├── officials/*.parquet   # official designations (append-only)
-├── summary/              # the disposable accuracy cache (+ validity token)
+├── summary/              # disposable accuracy cache (immutable generations + pointer)
 ├── runs.json             # run manifest (identity, visibility, idempotency)
 ├── actuals_manifest.json # actuals/officials visibility (transactional commit)
 ├── segment_integrity.json# size/mtime/sha256 per committed segment (tamper check)

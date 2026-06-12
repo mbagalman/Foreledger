@@ -9,10 +9,12 @@ crashed ingest leaves the archive at its pre-run state.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
 import os
+import re
 import uuid
 from collections.abc import Sequence
 from pathlib import Path
@@ -111,12 +113,29 @@ class DuckDBBackend(Backend):
         return path.relative_to(self.store).as_posix()
 
     def replace_summary(self, frame: pd.DataFrame, state_token: str) -> None:
-        # Data first, token second: a crash in between leaves a mismatched
-        # token, so the half-replaced summary is never served.
-        self._atomic_write(frame, self.summary_dir / "summary.parquet")
+        # Generation publication: the data lands under a unique immutable
+        # name first, then ONE atomic metadata write — naming both the token
+        # and the data file — publishes it. A reader captures the metadata
+        # once and reads only that generation, so it can never pair one
+        # generation's token with another's data, no matter how the reads
+        # interleave with this replacement. (Writers are serialized by the
+        # archive's store lock; the cleanup below can therefore never race
+        # another writer's about-to-be-published generation.)
+        name = f"summary-{uuid.uuid4().hex}.parquet"
+        self._atomic_write(frame, self.summary_dir / name)
         atomic_write_json(
-            self.summary_dir / "summary_meta.json", {"state_token": state_token}, indent=None
+            self.summary_dir / "summary_meta.json",
+            {"state_token": state_token, "data": name},
+            indent=None,
         )
+        for stale in self.summary_dir.glob("summary*.parquet"):
+            if stale.name != name:
+                # best-effort: a reader holding the old generation open keeps
+                # its file alive (Windows) — the next replacement sweeps it; a
+                # reader that loses this race treats the missing file as an
+                # absent cache and computes from raw
+                with contextlib.suppress(OSError):
+                    stale.unlink()
 
     # -- reads ---------------------------------------------------------------
 
@@ -206,16 +225,28 @@ class DuckDBBackend(Backend):
             relative(self._files(self.officials_dir)),
         )
 
+    #: A published summary generation is one flat, backend-minted file name;
+    #: ``summary.parquet`` is the pre-generation legacy layout. A metadata
+    #: file naming anything else is treated as an absent cache, never
+    #: resolved — a tampered pointer must not read files outside the cache.
+    _SUMMARY_DATA_PATTERN = re.compile(r"^summary(-[0-9a-f]{32})?\.parquet$")
+
     def read_summary(self) -> tuple[pd.DataFrame, str] | None:
-        path = self.summary_dir / "summary.parquet"
         meta_path = self.summary_dir / "summary_meta.json"
-        if not path.exists() or not meta_path.exists():
+        if not meta_path.exists():
             return None
-        # The summary is a disposable cache: any read or schema failure is
-        # cache invalidation (rebuildable from raw), never a query error.
+        # The summary is a disposable cache: any read or schema failure —
+        # including losing the data file to a concurrent replacement's
+        # cleanup — is cache invalidation (rebuildable from raw), never a
+        # query error. The single metadata read yields a coherent
+        # (token, generation) pair; the generation file itself is immutable.
         try:
-            token = str(json.loads(meta_path.read_text(encoding="utf-8"))["state_token"])
-            frame = pd.read_parquet(path)
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            token = str(meta["state_token"])
+            name = str(meta.get("data", "summary.parquet"))  # legacy layout fallback
+            if not self._SUMMARY_DATA_PATTERN.match(name):
+                raise ValueError(f"invalid summary data name {name!r}")
+            frame = pd.read_parquet(self.summary_dir / name)
             frame["horizon"] = frame["horizon"].astype("int64")
             frame["n"] = frame["n"].astype("int64")
         except Exception:
