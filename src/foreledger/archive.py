@@ -878,7 +878,7 @@ class ForecastArchive:
         if stored is None:
             return None
         frame, token = stored
-        if token != self._state_token() or "n_forecasts" not in frame.columns:
+        if token != self._state_token():
             return None
         return frame
 
@@ -958,7 +958,7 @@ class ForecastArchive:
         stored = None
         if stored_pair is not None:
             frame, token = stored_pair
-            if token == snap.summary_token and "n_forecasts" in frame.columns:
+            if token == snap.summary_token:
                 stored = frame
         if stored is None:
             # absent or stale: rebuild rather than diagnose — it was never

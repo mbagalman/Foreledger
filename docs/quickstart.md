@@ -299,8 +299,10 @@ from raw.
 
 The summary half of `reconcile()` should never fail — the summary is
 rebuilt eagerly on every write, validated against the raw state before it
-is ever served, and fully disposable (delete it and queries fall back to
-raw, invisibly). If it ever does fail, that's a bug worth reporting, not a
+is ever served (each published summary carries a content digest, so an
+externally modified cache file is discarded and recomputed from raw, never
+served), and fully disposable (delete it and queries fall back to raw,
+invisibly). If it ever does fail, that's a bug worth reporting, not a
 tolerance to widen.
 
 ## 7. Custom metrics

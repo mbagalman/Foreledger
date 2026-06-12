@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import io
 import json
 import logging
 import os
@@ -25,7 +26,7 @@ import pandas as pd
 
 from ..errors import StoreFormatError
 from ..jsonstore import atomic_write_json
-from ..schema import empty_actuals, empty_forecasts
+from ..schema import SUMMARY_COLUMNS, empty_actuals, empty_forecasts
 from .base import Backend, Dialect, ForecastFilter, build_forecast_predicate
 
 logger = logging.getLogger("foreledger.backend")
@@ -114,19 +115,23 @@ class DuckDBBackend(Backend):
 
     def replace_summary(self, frame: pd.DataFrame, state_token: str) -> None:
         # Generation publication: the data lands under a unique immutable
-        # name first, then ONE atomic metadata write — naming both the token
-        # and the data file — publishes it. A reader captures the metadata
-        # once and reads only that generation, so it can never pair one
-        # generation's token with another's data, no matter how the reads
-        # interleave with this replacement. (Writers are serialized by the
-        # archive's store lock; the cleanup below can therefore never race
-        # another writer's about-to-be-published generation.)
+        # name first, then ONE atomic metadata write — naming the token, the
+        # data file, AND the data file's content digest — publishes it. A
+        # reader captures the metadata once and reads only that generation,
+        # so it can never pair one generation's token with another's data, no
+        # matter how the reads interleave with this replacement; and a
+        # generation whose bytes no longer match the published digest (an
+        # in-place edit, disk corruption) is discarded as an absent cache,
+        # never served. (Writers are serialized by the archive's store lock;
+        # the cleanup below can therefore never race another writer's
+        # about-to-be-published generation.)
         name = f"summary-{uuid.uuid4().hex}.parquet"
         self._atomic_write(frame, self.summary_dir / name)
+        digest = hashlib.sha256((self.summary_dir / name).read_bytes()).hexdigest()
         try:
             atomic_write_json(
                 self.summary_dir / "summary_meta.json",
-                {"state_token": state_token, "data": name},
+                {"state_token": state_token, "data": name, "sha256": digest},
                 indent=None,
             )
         except BaseException:
@@ -232,30 +237,51 @@ class DuckDBBackend(Backend):
             relative(self._files(self.officials_dir)),
         )
 
-    #: A published summary generation is one flat, backend-minted file name;
-    #: ``summary.parquet`` is the pre-generation legacy layout. A metadata
-    #: file naming anything else is treated as an absent cache, never
-    #: resolved — a tampered pointer must not read files outside the cache.
-    _SUMMARY_DATA_PATTERN = re.compile(r"^summary(-[0-9a-f]{32})?\.parquet$")
+    #: A published summary generation is one flat, backend-minted file name.
+    #: A metadata file naming anything else is treated as an absent cache,
+    #: never resolved — a tampered pointer must not read files outside the
+    #: cache. (Pre-generation layouts simply fail this contract and rebuild.)
+    _SUMMARY_DATA_PATTERN = re.compile(r"^summary-[0-9a-f]{32}\.parquet$")
+
+    #: Integer / float dtype contracts re-imposed on read; the object-typed
+    #: identity columns need no coercion.
+    _SUMMARY_INT_COLUMNS = ("horizon", "n", "n_forecasts")
 
     def read_summary(self) -> tuple[pd.DataFrame, str] | None:
         meta_path = self.summary_dir / "summary_meta.json"
         if not meta_path.exists():
             return None
-        # The summary is a disposable cache: any read or schema failure —
-        # including losing the data file to a concurrent replacement's
-        # cleanup — is cache invalidation (rebuildable from raw), never a
-        # query error. The single metadata read yields a coherent
-        # (token, generation) pair; the generation file itself is immutable.
+        # The summary is a disposable cache: ANY failure here — unreadable
+        # metadata, a generation lost to a concurrent replacement's cleanup,
+        # bytes that no longer match the published content digest (in-place
+        # edit, disk corruption), or a frame that violates the summary schema
+        # contract — is cache invalidation (rebuildable from raw), never a
+        # query error or a served number. The single metadata read yields a
+        # coherent (token, generation, digest) triple, and the digest is
+        # checked over the same bytes that are parsed. Boundary: this makes
+        # single-file modification loud; coordinated edits to the generation
+        # AND its pointer are caught by reconcile(), the same trust boundary
+        # as the rest of the disposable cache.
         try:
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
             token = str(meta["state_token"])
-            name = str(meta.get("data", "summary.parquet"))  # legacy layout fallback
+            name = str(meta["data"])
+            digest = str(meta["sha256"])
             if not self._SUMMARY_DATA_PATTERN.match(name):
                 raise ValueError(f"invalid summary data name {name!r}")
-            frame = pd.read_parquet(self.summary_dir / name)
-            frame["horizon"] = frame["horizon"].astype("int64")
-            frame["n"] = frame["n"].astype("int64")
+            raw = (self.summary_dir / name).read_bytes()
+            if hashlib.sha256(raw).hexdigest() != digest:
+                raise ValueError("summary generation does not match its published digest")
+            frame = pd.read_parquet(io.BytesIO(raw))
+            if frame.columns.duplicated().any():
+                raise ValueError("summary frame has duplicate columns")
+            missing = [column for column in SUMMARY_COLUMNS if column not in frame.columns]
+            if missing:
+                raise ValueError(f"summary frame is missing columns {missing}")
+            frame = frame[SUMMARY_COLUMNS].copy()
+            for column in self._SUMMARY_INT_COLUMNS:
+                frame[column] = frame[column].astype("int64")
+            frame["value"] = frame["value"].astype("float64")
         except Exception:
             logger.warning(
                 "stored summary is unreadable; treating it as absent (it will be rebuilt from raw)",

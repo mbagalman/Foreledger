@@ -367,3 +367,66 @@ def test_failed_pointer_publication_does_not_leak_generations(
     monkeypatch.undo()
     populated.rebuild_summary()
     populated.reconcile()
+
+
+def test_modified_summary_generation_is_never_served(populated: ForecastArchive) -> None:
+    """Review reproduction: an in-place edit of the current summary
+    generation (valid Parquet, pointer untouched) must be discarded by the
+    published content digest and the query computed from raw — the
+    disposable cache is never authoritative over raw."""
+    expected = populated.accuracy_at_horizon(1, model_id="alpha", model_version="v1")
+    assert expected.served_from == "summary"
+
+    stored = populated._backend.read_summary()
+    assert stored is not None
+    tampered = stored[0].copy()
+    tampered["value"] = 12345.0
+    tampered.to_parquet(summary_data_file(populated), index=False)  # pointer untouched
+
+    result = populated.accuracy_at_horizon(1, model_id="alpha", model_version="v1")
+    assert result.served_from == "raw"
+    assert result.value == expected.value
+    assert result.value != 12345.0
+
+
+@pytest.mark.parametrize(
+    "dropped",
+    [
+        "model_id",
+        "model_version",
+        "series_id",
+        "horizon",
+        "metric",
+        "period",
+        "actual_basis",
+        "value",
+        "n",
+        "n_forecasts",
+    ],
+)
+def test_summary_missing_column_falls_back_to_raw(populated: ForecastArchive, dropped: str) -> None:
+    """Review reproduction: a readable generation violating the summary
+    schema contract (published with a valid digest and current token) must
+    be treated as an absent cache, never crash the query."""
+    expected = populated.accuracy_at_horizon(1, model_id="alpha", model_version="v1")
+    stored = populated._backend.read_summary()
+    assert stored is not None
+    malformed = stored[0].drop(columns=[dropped])
+    populated._backend.replace_summary(malformed, populated._state_token())
+
+    result = populated.accuracy_at_horizon(1, model_id="alpha", model_version="v1")
+    assert result.served_from == "raw"
+    assert result.value == expected.value
+
+
+def test_summary_incompatible_dtype_falls_back_to_raw(populated: ForecastArchive) -> None:
+    expected = populated.accuracy_at_horizon(1, model_id="alpha", model_version="v1")
+    stored = populated._backend.read_summary()
+    assert stored is not None
+    malformed = stored[0].copy()
+    malformed["value"] = "not-a-number"
+    populated._backend.replace_summary(malformed, populated._state_token())
+
+    result = populated.accuracy_at_horizon(1, model_id="alpha", model_version="v1")
+    assert result.served_from == "raw"
+    assert result.value == expected.value

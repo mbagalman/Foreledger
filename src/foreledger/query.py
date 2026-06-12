@@ -131,8 +131,10 @@ class Evaluator:
             stored = self._backend.read_summary()
             snap.summary = None
             if stored is not None:
+                # the backend guarantees the schema contract; only the
+                # snapshot-token gate is decided here
                 frame, token = stored
-                if token == snap.summary_token and "n_forecasts" in frame.columns:
+                if token == snap.summary_token:
                     snap.summary = frame
             snap.summary_loaded = True
         return snap.summary

@@ -246,17 +246,17 @@ def test_reader_never_pairs_old_token_with_new_summary_data(
     )
 
     # interleave: B commits + republishes the summary AFTER A has read the
-    # summary metadata and BEFORE A reads the summary data file
-    real_read_parquet = backend_module.pd.read_parquet
+    # summary metadata and BEFORE A reads the summary generation's bytes
+    real_read_bytes = backend_module.Path.read_bytes
     fired = {"done": False}
 
-    def interleaved(path, *args, **kwargs):  # type: ignore[no-untyped-def]
-        if not fired["done"] and "summary" in str(path):
+    def interleaved(self: Path) -> bytes:
+        if not fired["done"] and self.name.startswith("summary-"):
             fired["done"] = True
             handle_b.register_actuals(revision, recorded_at="2026-01-20")
-        return real_read_parquet(path, *args, **kwargs)
+        return real_read_bytes(self)
 
-    monkeypatch.setattr(backend_module.pd, "read_parquet", interleaved)
+    monkeypatch.setattr(backend_module.Path, "read_bytes", interleaved)
     curve = handle_a.accuracy_curve(
         metric="MAE", model_id="alpha", model_version="v1", horizons=[1, 2]
     )
