@@ -9,8 +9,9 @@ log, and answers the questions production forecasting teams actually ask:
 - What did we know at the time? (``as_of`` — no hindsight leakage)
 
 Start with :class:`ForecastArchive`; everything else hangs off it. See
-``docs/quickstart.md`` for a guided tour and ``AGENTS.md`` + ``docs/`` for
-architecture decisions (ADR-001..007) and the phased plan.
+``docs/quickstart.md`` for a guided tour and ``AGENTS.md`` +
+``docs/internal/`` for architecture decisions (ADR-001..007) and the
+phased plan.
 """
 
 from .archive import ForecastArchive

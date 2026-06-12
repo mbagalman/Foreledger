@@ -15,7 +15,7 @@ LINK_RE = re.compile(r"\[[^\]]*\]\(([^)\s]+)\)")
 
 
 def doc_files(root: Path) -> list[Path]:
-    return [*root.glob("*.md"), *(root / "docs").glob("*.md")]
+    return [*root.glob("*.md"), *(root / "docs").rglob("*.md")]
 
 
 def main() -> int:

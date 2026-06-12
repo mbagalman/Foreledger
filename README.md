@@ -129,8 +129,9 @@ Foreledger is a small, layered Python library (≥ 3.11):
   code leaks out of the backend module.
 
 Architecture and the decisions behind it are documented in
-[docs/](docs/): the [tech spec](docs/tech-spec-forecast-archive-final.md),
-ADRs 001–007, and the [implementation plan](docs/implementation-plan-forecast-archive.md).
+[docs/internal/](docs/internal/): the
+[tech spec](docs/internal/tech-spec-forecast-archive-final.md), ADRs 001–007,
+and the [implementation plan](docs/internal/implementation-plan-forecast-archive.md).
 Contributor ground rules live in [AGENTS.md](AGENTS.md).
 
 ## Development
@@ -145,7 +146,7 @@ python examples/quickstart.py
 
 ## Status & roadmap
 
-Working MVP (Phases 1–4 of the [plan](docs/implementation-plan-forecast-archive.md)):
+Working MVP (Phases 1–4 of the [plan](docs/internal/implementation-plan-forecast-archive.md)):
 the full ingestion → actuals → evaluation surface described above, gated by CI.
 Next: packaging and PyPI release (Phase 5), then the Snowflake warehouse
 backend as v1.1 (Phase 6).
