@@ -60,10 +60,30 @@ from .locking import StoreLock
 from .metrics import DEFAULT_METRIC_TIMEOUT, MetricFn, MetricRegistry
 from .query import Evaluator, Period, QuerySnapshot
 from .results import AccuracyCurve, AccuracyResult
-from .schema import FORMAT_VERSION
+from .schema import FORMAT_VERSION, SUMMARY_COLUMNS, SUMMARY_DTYPES
 from .summary import build_summary
 
 logger = logging.getLogger("foreledger")
+
+
+def _summary_divergence_detail(stored: pd.DataFrame, recomputed: pd.DataFrame) -> str:
+    """A short description of the first place two canonicalized summary frames
+    differ, for the ReconciliationError message. Best-effort — never raises."""
+    try:
+        if len(stored) != len(recomputed):
+            return f"; row counts differ: {len(stored)} vs {len(recomputed)}"
+        for column in stored.columns:
+            left, right = stored[column], recomputed[column]
+            unequal = ~((left == right) | (left.isna() & right.isna()))
+            if unequal.any():
+                i = int(unequal.to_numpy().argmax())
+                return (
+                    f"; first difference in column {column!r} at row {i}: "
+                    f"stored={left.iloc[i]!r} recomputed={right.iloc[i]!r}"
+                )
+        return ""
+    except Exception:  # diagnostics must never mask the real error
+        return ""
 
 
 class ForecastArchive:
@@ -1039,12 +1059,27 @@ class ForecastArchive:
             "horizon",
             "period",
         ]
-        stored_sorted = stored.sort_values(key, kind="mergesort").reset_index(drop=True)
-        recomputed_sorted = recomputed.sort_values(key, kind="mergesort").reset_index(drop=True)
+
+        def canonical(frame: pd.DataFrame) -> pd.DataFrame:
+            # Compare against the summary's declared schema, not the incidental
+            # dtypes a parquet round-trip vs a fresh from_records happen to
+            # produce: DataFrame.equals is dtype-strict and those can differ by
+            # platform (e.g. object vs arrow-backed string), which would raise a
+            # false divergence on a healthy store.
+            return (
+                frame[SUMMARY_COLUMNS]
+                .astype(SUMMARY_DTYPES)
+                .sort_values(key, kind="mergesort")
+                .reset_index(drop=True)
+            )
+
+        stored_sorted = canonical(stored)
+        recomputed_sorted = canonical(recomputed)
         if not stored_sorted.equals(recomputed_sorted):
             raise ReconciliationError(
                 f"stored summary ({len(stored_sorted)} cells) does not equal the raw "
                 f"recomputation ({len(recomputed_sorted)} cells)"
+                f"{_summary_divergence_detail(stored_sorted, recomputed_sorted)}"
             )
 
     # -- conflict audit -------------------------------------------------------
