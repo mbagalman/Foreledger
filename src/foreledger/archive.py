@@ -41,6 +41,7 @@ from .backend import Backend, ForecastFilter, create_backend
 from .errors import (
     ConflictLogError,
     PartialCommitError,
+    ReconciliationConflict,
     ReconciliationError,
     StoreFormatError,
     ValidationError,
@@ -608,14 +609,15 @@ class ForecastArchive:
         """The persisted champion version per model_id."""
         if not self._champions_path.exists():
             return {}
+        corrupt = f"champions file at {self._champions_path} is unreadable or corrupt"
         try:
             loaded = json.loads(self._champions_path.read_text(encoding="utf-8"))
-            if not isinstance(loaded, dict):
-                raise TypeError("champions payload is not an object")
-        except (json.JSONDecodeError, TypeError) as exc:
-            raise StoreFormatError(
-                f"champions file at {self._champions_path} is unreadable or corrupt"
-            ) from exc
+        except ValueError as exc:
+            # ValueError covers malformed JSON (JSONDecodeError) and invalid
+            # UTF-8 bytes (UnicodeDecodeError) — both mean the file is corrupt
+            raise StoreFormatError(corrupt) from exc
+        if not isinstance(loaded, dict):
+            raise StoreFormatError(corrupt)
         return {str(k): str(v) for k, v in loaded.items()}
 
     def register_metric(self, name: str, fn: MetricFn, summarizable: bool = True) -> None:
@@ -928,6 +930,14 @@ class ForecastArchive:
             frame = self._recompute_summary_from(snap)
             if self._publish_summary(frame, snap.summary_token):
                 return
+        # The state kept moving under us (concurrent writers, or a metric
+        # quarantining itself mid-build). The summary is disposable and no
+        # wrong number was served, but silently returning would hide that this
+        # explicit rebuild stored nothing — leave a signal for the operator.
+        logger.warning(
+            "summary rebuild did not converge: the archive state kept changing; "
+            "the summary is left stale for the next write or reconcile to repair"
+        )
 
     def _refresh_summary_after_write(self) -> None:
         """Eagerly refresh the summary after a raw write, without letting a
@@ -959,7 +969,10 @@ class ForecastArchive:
         Divergence is a defect (ADR-003); raises :class:`ReconciliationError`.
         A summary that is merely absent or stale (e.g. after a crashed
         refresh) is rebuilt instead — staleness is recoverable by design;
-        disagreement at the same raw state is not. As the deep-audit
+        disagreement at the same raw state is not. If concurrent writers keep
+        moving the state so no single state can be audited, this raises the
+        transient :class:`ReconciliationConflict` (not a defect — retry when
+        writes settle) rather than a false all-clear. As the deep-audit
         entrypoint, this also verifies the full content hash of every
         committed segment (queries only probe size/mtime).
         """
@@ -991,7 +1004,7 @@ class ForecastArchive:
             if self._state_token() == snap.summary_token:
                 break
         else:
-            raise ReconciliationError(
+            raise ReconciliationConflict(
                 "could not capture a stable archive state to reconcile against "
                 "(concurrent writers kept committing); retry when writes settle"
             )
@@ -1002,10 +1015,19 @@ class ForecastArchive:
             if token == snap.summary_token:
                 stored = frame
         if stored is None:
-            # absent or stale: rebuild rather than diagnose — it was never
-            # being served. Same staleness guard as rebuild_summary: if the
-            # state moved while recomputing, leave the repair to the writer
-            # that moved it.
+            # Genuinely stale/absent means the state has NOT moved since our
+            # stable capture (so no summary is being served): rebuild and
+            # return. But a token mismatch can also mean a concurrent writer
+            # republished a NEW generation in the gap before this read — that
+            # summary IS being served and we never compared it, so passing
+            # silently would report a clean audit of unexamined state. Re-check
+            # the token: if the state moved, raise the same transient signal as
+            # the stability loop rather than a false all-clear.
+            if self._state_token() != snap.summary_token:
+                raise ReconciliationConflict(
+                    "the archive state changed during reconciliation (a "
+                    "concurrent writer committed); retry when writes settle"
+                )
             self._publish_summary(recomputed, snap.summary_token)
             return
         key = [

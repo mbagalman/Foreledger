@@ -185,7 +185,7 @@ def test_summary_replacement_holds_the_store_lock(
     """Review reproduction guard: the summary data + validity token must be
     replaced while holding the store lock, so two handles' rebuilds can
     never interleave one handle's data with the other's token."""
-    import pytest as _pytest
+    import threading
 
     from foreledger import StoreLockTimeout
     from foreledger.locking import StoreLock
@@ -198,8 +198,24 @@ def test_summary_replacement_holds_the_store_lock(
     probed = {"locked": False}
 
     def probing_replace(frame, token):  # type: ignore[no-untyped-def]
-        with _pytest.raises(StoreLockTimeout), StoreLock(store / ".foreledger.lock", timeout=0.2):
-            pass
+        # Probe from ANOTHER thread: the store lock is an OS byte lock, so a
+        # competing acquirer blocks and times out, proving replace_summary runs
+        # while the lock is held. (Re-acquiring on this same thread is a
+        # non-reentrancy bug the lock now rejects outright, so it cannot be the
+        # probe.)
+        outcome: dict[str, bool] = {}
+
+        def compete() -> None:
+            try:
+                with StoreLock(store / ".foreledger.lock", timeout=0.2):
+                    outcome["acquired"] = True
+            except StoreLockTimeout:
+                outcome["blocked"] = True
+
+        thread = threading.Thread(target=compete)
+        thread.start()
+        thread.join()
+        assert outcome.get("blocked") and "acquired" not in outcome
         probed["locked"] = True
         real_replace(frame, token)
 

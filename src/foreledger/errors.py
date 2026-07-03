@@ -78,5 +78,17 @@ class UnknownMetricError(ForecastArchiveError):
 class ReconciliationError(ForecastArchiveError):
     """The stored summary disagrees with a recomputation from raw.
 
-    This is a defect, never a tolerance (ADR-003).
+    This is a defect, never a tolerance (ADR-003). A *transient* inability to
+    capture a stable state under concurrent writers is a different condition
+    and raises :class:`ReconciliationConflict` instead, so a caller keying on
+    the exception type never mistakes contention for a data defect.
+    """
+
+
+class ReconciliationConflict(ForecastArchiveError):
+    """``reconcile()`` could not verify against a stable state because
+    concurrent writers kept committing.
+
+    Not a defect and not caught by ``except ReconciliationError``: the store
+    is not known to disagree with raw — simply retry when writes settle.
     """

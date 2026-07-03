@@ -26,7 +26,7 @@ import pandas as pd
 
 from ..errors import StoreFormatError
 from ..jsonstore import atomic_write_json
-from ..schema import SUMMARY_COLUMNS, empty_actuals, empty_forecasts
+from ..schema import SUMMARY_COLUMNS, SUMMARY_DTYPES, empty_actuals, empty_forecasts
 from .base import Backend, Dialect, ForecastFilter, build_forecast_predicate
 
 logger = logging.getLogger("foreledger.backend")
@@ -88,10 +88,29 @@ class DuckDBBackend(Backend):
         return f"read_parquet([{quoted}], union_by_name=true)"
 
     @staticmethod
-    def _atomic_write(frame: pd.DataFrame, path: Path) -> None:
-        tmp = path.with_suffix(".parquet.tmp")
-        frame.to_parquet(tmp, engine="pyarrow", index=False)
+    def _tmp_path(path: Path) -> Path:
+        """The atomic-write temp sibling for a parquet path. One place owns
+        this naming so the write, the failure cleanup, and the stale sweep
+        can never drift apart."""
+        return path.with_suffix(".parquet.tmp")
+
+    @staticmethod
+    def _to_parquet_bytes(frame: pd.DataFrame) -> bytes:
+        buffer = io.BytesIO()
+        frame.to_parquet(buffer, engine="pyarrow", index=False)
+        return buffer.getvalue()
+
+    @staticmethod
+    def _atomic_write_bytes(data: bytes, path: Path) -> None:
+        """The single low-level parquet write seam: temp sibling + os.replace.
+        replace_summary reuses it so it can hash the exact bytes it writes."""
+        tmp = DuckDBBackend._tmp_path(path)
+        tmp.write_bytes(data)
         os.replace(tmp, path)
+
+    @staticmethod
+    def _atomic_write(frame: pd.DataFrame, path: Path) -> None:
+        DuckDBBackend._atomic_write_bytes(DuckDBBackend._to_parquet_bytes(frame), path)
 
     def _query(self, sql: str, params: list[Any]) -> pd.DataFrame:
         return self._connection().execute(sql, params).df()
@@ -127,19 +146,32 @@ class DuckDBBackend(Backend):
         # about-to-be-published generation.)
         name = f"summary-{uuid.uuid4().hex}.parquet"
         path = self.summary_dir / name
+        meta_path = self.summary_dir / "summary_meta.json"
         try:
-            self._atomic_write(frame, path)
-            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            # hash the exact bytes we write (no read-back from disk — this runs
+            # under the archive's store lock, so the extra I/O would widen the
+            # window in which concurrent writers are blocked)
+            data = self._to_parquet_bytes(frame)
+            digest = hashlib.sha256(data).hexdigest()
+            self._atomic_write_bytes(data, path)
             atomic_write_json(
-                self.summary_dir / "summary_meta.json",
+                meta_path,
                 {"state_token": state_token, "data": name, "sha256": digest},
                 indent=None,
             )
         except BaseException:
-            # nothing was published: remove this attempt's data file AND its
-            # temp file so repeated tolerated refresh failures (the boundary
-            # this cache is designed to survive) cannot accumulate orphans
-            for leftover in (path, path.with_suffix(".parquet.tmp")):
+            # Roll back a FAILED attempt's leftovers. Publication is the atomic
+            # meta write above; if an async interrupt lands *after* it, the meta
+            # already names this generation, so unlinking the data file would
+            # strand the live pointer — re-read the meta and keep the file if it
+            # won. The temp file is always safe to remove.
+            published = False
+            with contextlib.suppress(OSError, ValueError):
+                published = json.loads(meta_path.read_text(encoding="utf-8")).get("data") == name
+            leftovers = [self._tmp_path(path)]
+            if not published:
+                leftovers.append(path)
+            for leftover in leftovers:
                 with contextlib.suppress(OSError):
                     leftover.unlink()
             raise
@@ -249,9 +281,10 @@ class DuckDBBackend(Backend):
     #: cache. (Pre-generation layouts simply fail this contract and rebuild.)
     _SUMMARY_DATA_PATTERN = re.compile(r"^summary-[0-9a-f]{32}\.parquet$")
 
-    #: Integer / float dtype contracts re-imposed on read; the object-typed
-    #: identity columns need no coercion.
-    _SUMMARY_INT_COLUMNS = ("horizon", "n", "n_forecasts")
+    #: The integer summary columns, derived from the one dtype contract in
+    #: schema.py so a new numeric column cannot silently skip read-path
+    #: coercion.
+    _SUMMARY_INT_COLUMNS = tuple(c for c in SUMMARY_COLUMNS if SUMMARY_DTYPES[c] == "int64")
 
     def read_summary(self) -> tuple[pd.DataFrame, str] | None:
         meta_path = self.summary_dir / "summary_meta.json"
@@ -284,10 +317,15 @@ class DuckDBBackend(Backend):
             missing = [column for column in SUMMARY_COLUMNS if column not in frame.columns]
             if missing:
                 raise ValueError(f"summary frame is missing columns {missing}")
-            frame = frame[SUMMARY_COLUMNS].copy()
+            frame = frame[SUMMARY_COLUMNS]
             for column in self._SUMMARY_INT_COLUMNS:
-                frame[column] = frame[column].astype("int64")
-            frame["value"] = frame["value"].astype("float64")
+                col = frame[column]
+                if col.dtype.kind == "f" and (col != col.round()).any():
+                    # astype("int64") would silently TRUNCATE a fractional
+                    # value (1.9 -> 1) and serve an altered number; a generation
+                    # that violates the integer contract is invalid cache
+                    raise ValueError(f"summary column {column!r} holds non-integer values")
+            frame = frame.astype({column: SUMMARY_DTYPES[column] for column in SUMMARY_COLUMNS})
         except Exception:
             logger.warning(
                 "stored summary is unreadable; treating it as absent (it will be rebuilt from raw)",

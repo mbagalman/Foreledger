@@ -170,10 +170,14 @@ class MetricRegistry:
         components = [
             f"metric:{m.name}:{m.fingerprint}" for m in self._metrics.values() if m.summarizable
         ]
+        # quarantined names are always a subset of registered metrics (only a
+        # metric that resolved can be quarantined, and metrics are never
+        # removed), so this just filters that subset down to the summarizable
+        # ones — the ones whose disappearance would move a served summary
         components.extend(
             f"quarantined:{name}"
             for name in sorted(self._quarantined)
-            if name in self._metrics and self._metrics[name].summarizable
+            if self._metrics[name].summarizable
         )
         return components
 

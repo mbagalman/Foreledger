@@ -119,6 +119,19 @@ def test_malformed_comparison_inputs_raise_typed_errors(populated: ForecastArchi
     # strings' characters — silently wrong champions
     with pytest.raises(ValidationError):
         populated.compare_models(1, [("alpha", "v1")], champion=["alpha", "v1"])
+    # a length-2 bytes entry must not be accepted as a garbage ('v', '1') pair
+    with pytest.raises(ValidationError):
+        populated.compare_models(1, [b"v1"])
+
+
+def test_compare_models_accepts_numpy_rows(populated: ForecastArchive) -> None:
+    """Self-review regression: numpy (model_id, model_version) rows — e.g.
+    ``df[[...]].to_numpy()`` — used to unpack fine and must keep working; the
+    tightened validator must not reject them."""
+    import numpy as np
+
+    frame = populated.compare_models(1, np.array([["alpha", "v1"], ["beta", "v1"]]))
+    assert set(frame["model_id"]) == {"alpha", "beta"}
 
 
 def test_compare_curve_empty_scope_keeps_schema(populated: ForecastArchive) -> None:

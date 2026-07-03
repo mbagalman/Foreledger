@@ -31,6 +31,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+import numpy as np
 import pandas as pd
 
 from .actuals import resolve_effective_latest, resolve_effective_official
@@ -98,26 +99,61 @@ def _series_list(series: str | Sequence[str] | None) -> list[str] | None:
     return values
 
 
+#: Horizons are int64 on the backend; anything outside that range is a mistake,
+#: not a query. Kept as a module constant so the bound is stated once.
+_HORIZON_MAX = 2**63 - 1
+
+
 def _validate_horizon(value: Any) -> int:
-    """Horizons are whole days; reject silent truncation (7.5 -> 7) and
-    string digits masquerading as numbers."""
-    if isinstance(value, bool):
+    """Horizons are whole days; reject silent truncation (7.5 -> 7), string
+    digits masquerading as numbers, and non-finite/out-of-range values."""
+    if isinstance(value, (bool, np.bool_)):
         raise ValidationError("horizon must be an integer number of days")
     try:
         as_int = int(value)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
+        # OverflowError: int(float('inf')) / int(float('nan')) variants
         raise ValidationError(f"horizon {value!r} is not an integer number of days") from exc
     if as_int != value:
         raise ValidationError(f"horizon {value!r} is not a whole number of days")
+    if not -_HORIZON_MAX <= as_int <= _HORIZON_MAX:
+        raise ValidationError(f"horizon {value!r} is out of range for a day count")
     return as_int
 
 
+def _validate_horizons(horizons: Sequence[int]) -> list[int]:
+    """Validate an explicit ``horizons`` list: iterable of whole days. A scalar
+    or string is a caller mistake and gets a typed error, not a bare
+    ``TypeError`` from the iteration."""
+    if isinstance(horizons, (str, bytes)):
+        raise ValidationError("horizons must be an iterable of integer days, or None")
+    try:
+        items = list(horizons)
+    except TypeError as exc:
+        raise ValidationError("horizons must be an iterable of integer days, or None") from exc
+    return [_validate_horizon(h) for h in items]
+
+
 def _validate_models(models: Sequence[tuple[str, str]]) -> list[tuple[str, str]]:
+    try:
+        entries = list(models)
+    except TypeError as exc:
+        raise ValidationError(
+            "models must be an iterable of (model_id, model_version) pairs"
+        ) from exc
     pairs: list[tuple[str, str]] = []
-    for entry in models:
-        if isinstance(entry, str) or not isinstance(entry, Sequence) or len(entry) != 2:
+    for entry in entries:
+        # str/bytes are iterable and length-2-able, so they must be rejected
+        # explicitly or 'v1'/b'v1' would mint a garbage ('v','1') pair; anything
+        # else that unpacks into exactly two items (tuple, list, numpy row) is
+        # accepted
+        if isinstance(entry, (str, bytes)):
             raise ValidationError("models must be (model_id, model_version) pairs")
-        pairs.append((str(entry[0]), str(entry[1])))
+        try:
+            first, second = entry
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("models must be (model_id, model_version) pairs") from exc
+        pairs.append((str(first), str(second)))
     if not pairs:
         raise ValidationError("models must list at least one (model_id, model_version)")
     return pairs
@@ -574,7 +610,7 @@ class Evaluator:
                 snap, model_id=model_id, model_version=model_version, series=series, period=period
             )
         else:
-            horizons = [_validate_horizon(h) for h in horizons]
+            horizons = _validate_horizons(horizons)
         points = tuple(
             self._accuracy(
                 snap,
@@ -618,7 +654,7 @@ class Evaluator:
             series=series,
             period=period,
         )
-        return pd.DataFrame(rows)
+        return pd.DataFrame(rows, columns=_COMPARE_COLUMNS)
 
     def compare_curve(
         self,
@@ -640,7 +676,7 @@ class Evaluator:
             # horizons must not inject all-insufficient rows into this curve
             horizons = self._horizons(snap, models=pairs, series=series, period=period)
         else:
-            horizons = [_validate_horizon(h) for h in horizons]
+            horizons = _validate_horizons(horizons)
         champions = self._champion_map(champion)
         rows: list[dict[str, Any]] = []
         for h in horizons:
@@ -657,9 +693,9 @@ class Evaluator:
                     period=period,
                 )
             )
-        if not rows:
-            return pd.DataFrame(columns=_COMPARE_COLUMNS)
-        return pd.DataFrame(rows)
+        # _COMPARE_COLUMNS is the single column contract on every exit, so the
+        # empty and non-empty frames can never disagree on schema
+        return pd.DataFrame(rows, columns=_COMPARE_COLUMNS)
 
     def as_of(
         self,

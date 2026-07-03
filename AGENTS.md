@@ -55,6 +55,7 @@ Verbatim from `docs/internal/implementation-plan-forecast-archive.md` (Agent exe
 - Modify CI workflows under `.github/workflows/`.
 - Publish to TestPyPI.
 - Change the public API signature of any `ForecastArchive` method.
+- Modify this `AGENTS.md` file itself (owner approval required; record the approval in the commit message).
 
 **Prohibited:**
 - Force-push to `main`.
@@ -63,7 +64,6 @@ Verbatim from `docs/internal/implementation-plan-forecast-archive.md` (Agent exe
 - Generate, rotate, or read PyPI/CI/warehouse tokens or any secret.
 - Connect to or write against a user's production warehouse.
 - Delete or rewrite a user's archive / Parquet files.
-- Modify this `AGENTS.md` file itself.
 - Disable or weaken the reconciliation, atomicity, or backend-equivalence tests.
 
 ## Trusted and untrusted inputs

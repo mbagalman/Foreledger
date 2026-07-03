@@ -68,13 +68,15 @@ def build_forecast_predicate(dialect: Dialect, flt: ForecastFilter) -> tuple[str
         clauses.append(f"{q('model_version')} = {ph}")
         params.append(flt.model_version)
     if flt.models is not None:
-        # an explicitly empty filter list matches nothing — and rendering an
-        # empty IN/OR group would be invalid SQL on some dialects
-        if not list(flt.models):
+        # materialize once (mirrors the series branch below): an explicitly
+        # empty filter list matches nothing — and rendering an empty IN/OR
+        # group would be invalid SQL on some dialects
+        models = list(flt.models)
+        if not models:
             return "1 = 0", []
         pair = f"({q('model_id')} = {ph} AND {q('model_version')} = {ph})"
-        clauses.append("(" + " OR ".join([pair] * len(flt.models)) + ")")
-        for model_id, model_version in flt.models:
+        clauses.append("(" + " OR ".join([pair] * len(models)) + ")")
+        for model_id, model_version in models:
             params.extend([model_id, model_version])
     if flt.series is not None:
         series = list(flt.series)
@@ -168,5 +170,14 @@ class Backend(ABC):
 
     @abstractmethod
     def read_summary(self) -> tuple[pd.DataFrame, str] | None:
-        """Read the stored summary and its raw-state token, or None if absent
-        (the summary is always rebuildable from raw)."""
+        """Read the stored summary and its raw-state token, or None if absent.
+
+        The summary is always rebuildable from raw, so callers gate only on the
+        token and then trust the frame — they no longer re-check its shape. An
+        implementation MUST therefore return None (never raise, never hand back
+        a malformed frame) for *any* unreadable, corrupt, or schema-violating
+        cache, and a non-None frame MUST have exactly the columns of
+        :data:`~foreledger.schema.SUMMARY_COLUMNS` coerced to the
+        :data:`~foreledger.schema.SUMMARY_DTYPES` types. A frame that cannot
+        meet that contract must be treated as absent (returned as None), not
+        served."""

@@ -504,15 +504,39 @@ def test_failed_summary_data_write_leaves_no_tmp_files(
     repeated tolerated refresh failures cannot accumulate orphans."""
     from pathlib import Path
 
-    def failing_atomic(frame: pd.DataFrame, path: Path) -> None:
+    def failing_atomic(data: bytes, path: Path) -> None:
         path.with_suffix(".parquet.tmp").write_bytes(b"partial")
         raise OSError("simulated ENOSPC")
 
-    monkeypatch.setattr(populated._backend, "_atomic_write", failing_atomic)
+    monkeypatch.setattr(populated._backend, "_atomic_write_bytes", failing_atomic)
     for _ in range(3):
         with pytest.raises(OSError, match="ENOSPC"):
             populated.rebuild_summary()
     assert not list((populated.store / "summary").glob("*.tmp"))
+
+
+def test_reconcile_under_relentless_churn_is_conflict_not_defect(
+    populated: ForecastArchive, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Self-review hardening: a store whose state never settles during
+    reconcile is transient contention, not a summary defect. It must raise the
+    retryable ReconciliationConflict — never ReconciliationError, which callers
+    key on as 'the stored summary disagrees with raw'."""
+    from foreledger import ReconciliationConflict, ReconciliationError
+
+    populated.rebuild_summary()
+    counter = {"n": 0}
+    real_token = populated._state_token
+
+    def churning_token() -> str:
+        counter["n"] += 1
+        return f"{real_token()}-{counter['n']}"
+
+    monkeypatch.setattr(populated, "_state_token", churning_token)
+    with pytest.raises(ReconciliationConflict):
+        populated.reconcile()
+    # the transient signal must not be catchable as the defect type
+    assert not issubclass(ReconciliationConflict, ReconciliationError)
 
 
 def test_metric_first_quarantined_during_reconcile_is_not_divergence(

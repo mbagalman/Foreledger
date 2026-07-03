@@ -66,6 +66,23 @@ def test_corrupt_metadata_is_a_typed_error(store: Path) -> None:
         ForecastArchive(store)
 
 
+def test_invalid_utf8_metadata_is_a_typed_error(store: Path) -> None:
+    """Self-review hardening: invalid UTF-8 bytes raise UnicodeDecodeError (a
+    ValueError sibling of JSONDecodeError, not a subclass) — the corruption
+    wrappers must catch it too, not leak an untyped decode error."""
+    ForecastArchive(store)
+    (store / "archive_meta.json").write_bytes(b"\xff\xfe\x00\x01")
+    with pytest.raises(StoreFormatError):
+        ForecastArchive(store)
+
+
+def test_invalid_utf8_champions_is_a_typed_error(store: Path) -> None:
+    archive = ForecastArchive(store)
+    (store / "champions.json").write_bytes(b"\xff\xfe\x00\x01")
+    with pytest.raises(StoreFormatError):
+        archive.champions()
+
+
 def test_archive_persists_across_reopen(store: Path) -> None:
     first = ForecastArchive(store)
     first.ingest(forecast_frame(1.0), model_id="alpha", model_version="v1")

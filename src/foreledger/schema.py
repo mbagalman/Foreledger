@@ -75,6 +75,24 @@ SUMMARY_COLUMNS = [
     "n_forecasts",
 ]
 
+#: Dtype contract for the summary columns, kept beside ``SUMMARY_COLUMNS`` so
+#: a column can never be added to one without the other. The backend re-imposes
+#: it on read, so a stored generation always round-trips to the same types a
+#: fresh recomputation produces — ``reconcile`` compares the two with
+#: :meth:`pandas.DataFrame.equals`, which is dtype-sensitive.
+SUMMARY_DTYPES: dict[str, str] = {
+    "model_id": "object",
+    "model_version": "object",
+    "series_id": "object",
+    "horizon": "int64",
+    "metric": "object",
+    "period": "object",
+    "actual_basis": "object",
+    "value": "float64",
+    "n": "int64",
+    "n_forecasts": "int64",
+}
+
 
 def to_timestamp(value: Any, field: str) -> pd.Timestamp:
     """Coerce a user-supplied origin/target to a pandas Timestamp.
@@ -149,16 +167,5 @@ def empty_actuals() -> pd.DataFrame:
 def empty_summary() -> pd.DataFrame:
     """An empty frame with the canonical summary schema."""
     return pd.DataFrame(
-        {
-            "model_id": pd.Series(dtype="object"),
-            "model_version": pd.Series(dtype="object"),
-            "series_id": pd.Series(dtype="object"),
-            "horizon": pd.Series(dtype="int64"),
-            "metric": pd.Series(dtype="object"),
-            "period": pd.Series(dtype="object"),
-            "actual_basis": pd.Series(dtype="object"),
-            "value": pd.Series(dtype="float64"),
-            "n": pd.Series(dtype="int64"),
-            "n_forecasts": pd.Series(dtype="int64"),
-        }
+        {column: pd.Series(dtype=SUMMARY_DTYPES[column]) for column in SUMMARY_COLUMNS}
     )

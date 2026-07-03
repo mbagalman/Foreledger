@@ -200,6 +200,24 @@ def test_query_inputs_are_validated(populated: ForecastArchive) -> None:
         )
 
 
+def test_horizon_edge_values_are_typed_errors(populated: ForecastArchive) -> None:
+    """Self-review hardening: non-finite and out-of-range horizons raise a
+    typed ValidationError (not an untyped OverflowError or a DuckDB engine
+    error), a numpy bool is not silently accepted as horizon 1, and a scalar
+    ``horizons=`` is a typed error rather than a bare TypeError."""
+    import numpy as np
+
+    from foreledger import ValidationError
+
+    for bad in (float("inf"), float("-inf"), float("nan"), 1e300):
+        with pytest.raises(ValidationError):
+            populated.accuracy_at_horizon(bad, model_id="alpha", model_version="v1")
+    with pytest.raises(ValidationError):
+        populated.accuracy_at_horizon(np.True_, model_id="alpha", model_version="v1")
+    with pytest.raises(ValidationError):
+        populated.accuracy_curve(horizons=7, model_id="alpha", model_version="v1")
+
+
 def test_empty_series_scope_is_a_typed_error(populated: ForecastArchive) -> None:
     """Review reproduction: series=[] previously rendered invalid SQL
     ("series_id" IN ()) and leaked a DuckDB ParserException through every

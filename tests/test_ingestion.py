@@ -288,3 +288,13 @@ def test_numeric_datetime_columns_are_rejected(archive: ForecastArchive) -> None
     frame["target"] = 20260601
     with pytest.raises(ValidationError, match="numeric"):
         archive.ingest(frame, model_id="alpha", model_version="v1")
+
+
+def test_object_column_hiding_numbers_is_rejected(archive: ForecastArchive) -> None:
+    """Self-review reproduction: an OBJECT-dtype column of ints (typical from
+    JSON/Excel/mixed input) slips past a dtype-only guard and pd.to_datetime
+    reads it as 1970 epoch nanoseconds — it must be rejected too."""
+    frame = forecast_frame(1.0)
+    frame["target"] = pd.Series([20260601] * len(frame), index=frame.index, dtype=object)
+    with pytest.raises(ValidationError, match="numeric"):
+        archive.ingest(frame, model_id="alpha", model_version="v1")

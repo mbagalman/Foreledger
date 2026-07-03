@@ -146,14 +146,32 @@ class RunManifest:
 def normalize_datetimes(series: pd.Series, field_name: str) -> pd.Series:
     """Coerce a column to naive pandas datetimes.
 
-    Numeric columns are rejected: pandas would silently read them as epoch
-    timestamps, turning a ``20260601``-style date column into 1970 dates.
+    Bare numbers are rejected: pandas would silently read them as epoch
+    timestamps, turning a ``20260601``-style date column into 1970 dates. The
+    check is on values, not just the column dtype — an ``object`` column can
+    hide numbers (ints from JSON/Excel, or a numeric column that picked up
+    object dtype from mixed input), and those would slip past a dtype-only
+    guard. Numeric *strings* like ``"20260601"`` are fine — pandas parses them
+    as calendar dates, not epochs.
     """
+    numeric_msg = (
+        f"column for {field_name!r} contains numeric values; datetimes are "
+        "required (bare numbers would be read as epoch timestamps)"
+    )
     if pd.api.types.is_numeric_dtype(series):
-        raise ValidationError(
-            f"column for {field_name!r} is numeric; datetimes are required "
-            "(numbers would be read as epoch timestamps)"
+        raise ValidationError(numeric_msg)
+    if series.dtype == object:
+        non_null = series.infer_objects().dropna()
+        hides_number = pd.api.types.is_numeric_dtype(non_null) or bool(
+            non_null.map(
+                lambda v: (
+                    isinstance(v, (int, float, np.integer, np.floating))
+                    and not isinstance(v, (bool, np.bool_))
+                )
+            ).any()
         )
+        if hides_number:
+            raise ValidationError(numeric_msg)
     try:
         converted = pd.to_datetime(series)
     except (ValueError, TypeError) as exc:
