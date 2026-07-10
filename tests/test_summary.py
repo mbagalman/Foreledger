@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -107,6 +108,50 @@ def test_non_summarizable_metric_computes_from_raw(populated: ForecastArchive) -
     result = populated.accuracy_at_horizon(1, metric="MedAE", model_id="alpha", model_version="v1")
     assert result.status == "ok"
     assert result.served_from == "raw"
+
+
+def test_pooled_scope_keeps_protocol_input_order(store: Path) -> None:
+    """Review reproduction: the MASE trajectory repair briefly sorted pooled
+    pairs model-first, silently reordering the arrays every registered custom
+    metric receives. The metric protocol documents (series_id, target) order;
+    in a pooled multi-model scope that interleaves the models at each target
+    (ties in deterministic model order), and it must stay that way."""
+
+    def one_model(first: float, second: float) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "series_id": ["S1", "S1"],
+                "origin": pd.to_datetime(["2026-01-01", "2026-01-02"]),
+                "target": pd.to_datetime(["2026-01-02", "2026-01-03"]),
+                "value": [first, second],
+            }
+        )
+
+    archive = ForecastArchive(store)
+    archive.ingest(one_model(1.0, 2.0), model_id="model-a", model_version="v1")
+    archive.ingest(one_model(10.0, 20.0), model_id="model-b", model_version="v1")
+    archive.register_actuals(
+        pd.DataFrame(
+            {
+                "series_id": ["S1", "S1"],
+                "target": pd.to_datetime(["2026-01-02", "2026-01-03"]),
+                "value": [5.0, 6.0],
+            }
+        )
+    )
+
+    captured: list[list[float]] = []
+
+    def probe(forecast: FloatArray, actual: FloatArray) -> float:
+        captured.append([float(v) for v in forecast])
+        return 1.0
+
+    archive.register_metric("Probe", probe, summarizable=False)
+    result = archive.accuracy_at_horizon(1, metric="Probe")  # pooled: both models
+    assert result.status == "ok"
+    # (series_id, target) order: both models' rows at target 01-02, then both
+    # at 01-03 — never one model's whole trajectory followed by the other's
+    assert captured[-1] == [1.0, 10.0, 2.0, 20.0]
 
 
 def test_bad_registered_metric_cannot_corrupt_recompute(populated: ForecastArchive) -> None:
@@ -502,7 +547,6 @@ def test_failed_summary_data_write_leaves_no_tmp_files(
 ) -> None:
     """A failing generation data write must clean up its own temp file —
     repeated tolerated refresh failures cannot accumulate orphans."""
-    from pathlib import Path
 
     def failing_atomic(data: bytes, path: Path) -> None:
         path.with_suffix(".parquet.tmp").write_bytes(b"partial")

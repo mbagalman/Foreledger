@@ -69,10 +69,19 @@ def mape(forecast: FloatArray, actual: FloatArray) -> float:
 
 
 def _mase_denominator(actual: FloatArray, series_breaks: FloatArray | None) -> float:
-    diffs = np.abs(np.diff(actual))
     if series_breaks is not None and len(series_breaks) == len(actual):
-        within = series_breaks[1:] == series_breaks[:-1]
-        diffs = diffs[within]
+        # Equal trajectory codes need not be adjacent: pooled multi-model
+        # scopes keep the protocol's (series_id, target) input order, which
+        # interleaves models at each target. A stable gather groups each
+        # trajectory while preserving its target order, so every lag-1 diff
+        # stays within one trajectory. (Already-contiguous codes — every
+        # single-model scope — gather as the identity.)
+        order = np.argsort(series_breaks, kind="stable")
+        gathered = actual[order]
+        codes = series_breaks[order]
+        diffs = np.abs(np.diff(gathered))[codes[1:] == codes[:-1]]
+    else:
+        diffs = np.abs(np.diff(actual))
     if len(diffs) == 0:
         return float("nan")
     return float(np.mean(diffs))
