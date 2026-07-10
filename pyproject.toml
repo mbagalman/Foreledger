@@ -19,6 +19,8 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering",
     "Typing :: Typed",
 ]
@@ -45,6 +47,11 @@ Repository = "https://github.com/mbagalman/Foreledger"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/foreledger"]
+
+[tool.hatch.build.targets.sdist]
+# ship what a consumer or distro packager needs (source, tests, user docs,
+# examples, doc-check scripts) — not repo/agent tooling or internal ADRs
+exclude = [".claude", ".github", "AGENTS.md", "docs/internal"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

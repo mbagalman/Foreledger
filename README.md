@@ -75,7 +75,7 @@ curve = archive.accuracy_curve(metric="MAE", model_id="prophet", model_version="
 print(curve.to_frame())
 ```
 
-**[Read the full quick-start guide →](docs/quickstart.md)**
+**[Read the full quick-start guide →](https://github.com/mbagalman/Foreledger/blob/main/docs/quickstart.md)**
 
 ## Key capabilities
 
@@ -129,10 +129,12 @@ Foreledger is a small, layered Python library (≥ 3.11):
   code leaks out of the backend module.
 
 Architecture and the decisions behind it are documented in
-[docs/internal/](docs/internal/): the
-[tech spec](docs/internal/tech-spec-forecast-archive-final.md), ADRs 001–007,
-and the [implementation plan](docs/internal/implementation-plan-forecast-archive.md).
-Contributor ground rules live in [AGENTS.md](AGENTS.md).
+[docs/internal/](https://github.com/mbagalman/Foreledger/tree/main/docs/internal): the
+[tech spec](https://github.com/mbagalman/Foreledger/blob/main/docs/internal/tech-spec-forecast-archive-final.md),
+ADRs 001–007, and the
+[implementation plan](https://github.com/mbagalman/Foreledger/blob/main/docs/internal/implementation-plan-forecast-archive.md).
+Contributor ground rules live in
+[AGENTS.md](https://github.com/mbagalman/Foreledger/blob/main/AGENTS.md).
 
 ## Development
 
@@ -146,11 +148,12 @@ python examples/quickstart.py
 
 ## Status & roadmap
 
-Working MVP (Phases 1–4 of the [plan](docs/internal/implementation-plan-forecast-archive.md)):
+Working MVP (Phases 1–4 of the
+[plan](https://github.com/mbagalman/Foreledger/blob/main/docs/internal/implementation-plan-forecast-archive.md)):
 the full ingestion → actuals → evaluation surface described above, gated by CI.
 Next: packaging and PyPI release (Phase 5), then the Snowflake warehouse
 backend as v1.1 (Phase 6).
 
 ## License
 
-[MIT](LICENSE).
+[MIT](https://github.com/mbagalman/Foreledger/blob/main/LICENSE).

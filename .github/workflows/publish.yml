@@ -1,0 +1,115 @@
+# Publishes to PyPI via Trusted Publishing (OIDC) — no API token stored in
+# the repo. One-time setup on PyPI is required before the first release:
+# pypi.org → your project (or "pending publishers" for a brand-new project) →
+# add a trusted publisher with:
+#   owner: mbagalman, repository: Foreledger,
+#   workflow: publish.yml, environment: pypi
+# Then create a GitHub environment named "pypi" in the repo settings and cut
+# a GitHub release whose tag matches the version in pyproject.toml
+# (e.g. tag v0.1.0) to trigger this workflow.
+#
+# Rehearsal: running this workflow manually (workflow_dispatch) publishes to
+# TestPyPI instead — same build and checks, different index — via the
+# "testpypi" environment. That needs its own trusted publisher on
+# test.pypi.org (same owner/repository/workflow, environment: testpypi).
+name: Publish to PyPI
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch: # rehearsal -> TestPyPI only; real releases go via a GitHub release
+
+jobs:
+  build:
+    name: Build distributions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      # The version lives in BOTH pyproject.toml and foreledger/__init__.py;
+      # fail fast if they disagree with each other, or (on a release) with
+      # the release tag — a release tagged v0.2.0 while the package still
+      # says 0.1.0 must not publish the wrong version under the wrong
+      # release page. Rehearsals have no tag; the consistency check still runs.
+      - name: Verify version consistency (and release tag on releases)
+        env:
+          TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || '' }}
+        run: |
+          python - <<'EOF'
+          import os
+          import pathlib
+          import re
+          import sys
+          import tomllib
+
+          pyproject = tomllib.loads(pathlib.Path("pyproject.toml").read_text())
+          declared = pyproject["project"]["version"]
+          init_text = pathlib.Path("src/foreledger/__init__.py").read_text()
+          dunder = re.search(r"__version__\s*=\s*['\"]([^'\"]+)['\"]", init_text).group(1)
+          print(f"pyproject.toml: {declared} | __init__.py: {dunder}")
+          if declared != dunder:
+              print("::error::pyproject.toml and src/foreledger/__init__.py disagree on the version")
+              sys.exit(1)
+          tag = os.environ.get("TAG", "")
+          if tag and tag != f"v{declared}":
+              print(f"::error::Release tag '{tag}' does not match package version 'v{declared}'. Bump the version or retag.")
+              sys.exit(1)
+          EOF
+
+      - name: Install build tooling
+        run: pip install build twine
+
+      - name: Build sdist and wheel
+        run: python -m build
+
+      - name: Check metadata
+        run: twine check dist/*
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    name: Upload to PyPI
+    if: github.event_name == 'release'
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  publish-testpypi:
+    name: Rehearsal upload to TestPyPI
+    if: github.event_name == 'workflow_dispatch'
+    needs: build
+    runs-on: ubuntu-latest
+    environment: testpypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to TestPyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          # A version can only be uploaded once per index; let a re-run of the
+          # rehearsal succeed as a no-op instead of failing the workflow.
+          skip-existing: true
