@@ -1,7 +1,8 @@
 """Accuracy metrics: built-ins and the registerable metric protocol (ADR-004).
 
 A metric is a callable over aligned ``(forecast, actual)`` float arrays,
-sorted by (series_id, target), returning a float. Built-ins (MAE/RMSE/MAPE/
+sorted by (series_id, target) — ties in pooled multi-model scopes broken by
+(model_id, model_version) — returning a float. Built-ins (MAE/RMSE/MAPE/
 MASE) are implemented *as* protocol-conforming metrics — one code path.
 
 Metrics registered with ``summarizable=True`` are precomputed into the

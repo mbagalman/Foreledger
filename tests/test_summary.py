@@ -110,12 +110,16 @@ def test_non_summarizable_metric_computes_from_raw(populated: ForecastArchive) -
     assert result.served_from == "raw"
 
 
-def test_pooled_scope_keeps_protocol_input_order(store: Path) -> None:
+def test_pooled_scope_keeps_protocol_input_order(
+    store: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Review reproduction: the MASE trajectory repair briefly sorted pooled
     pairs model-first, silently reordering the arrays every registered custom
-    metric receives. The metric protocol documents (series_id, target) order;
-    in a pooled multi-model scope that interleaves the models at each target
-    (ties in deterministic model order), and it must stay that way."""
+    metric receives. The metric protocol documents (series_id, target) order
+    with (model_id, model_version) tie-breaks; a pooled multi-model scope
+    interleaves the models at each target, and the order must hold even when
+    the backend returns rows in some other order (the backend seam makes no
+    ordering promise — here it is deliberately reversed)."""
 
     def one_model(first: float, second: float) -> pd.DataFrame:
         return pd.DataFrame(
@@ -140,6 +144,13 @@ def test_pooled_scope_keeps_protocol_input_order(store: Path) -> None:
         )
     )
 
+    real_read = archive._backend.read_forecasts
+
+    def reversed_read(flt):  # type: ignore[no-untyped-def]
+        return real_read(flt).iloc[::-1].reset_index(drop=True)
+
+    monkeypatch.setattr(archive._backend, "read_forecasts", reversed_read)
+
     captured: list[list[float]] = []
 
     def probe(forecast: FloatArray, actual: FloatArray) -> float:
@@ -150,7 +161,8 @@ def test_pooled_scope_keeps_protocol_input_order(store: Path) -> None:
     result = archive.accuracy_at_horizon(1, metric="Probe")  # pooled: both models
     assert result.status == "ok"
     # (series_id, target) order: both models' rows at target 01-02, then both
-    # at 01-03 — never one model's whole trajectory followed by the other's
+    # at 01-03 (model-a first per tie-break) — never one model's whole
+    # trajectory followed by the other's, and never the backend's row order
     assert captured[-1] == [1.0, 10.0, 2.0, 20.0]
 
 

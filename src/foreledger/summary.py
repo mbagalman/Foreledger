@@ -35,16 +35,20 @@ def metric_over_pairs(
 ) -> tuple[float | None, int]:
     """Evaluate one metric over aligned forecast/actual pairs.
 
-    Pairs are sorted by (series_id, target) deterministically — the metric
-    protocol's documented input order — so the same scope always yields
-    bit-identical results on both the summary and raw paths. Trajectory codes
-    identify each (model, version, series) trajectory for lag-based
-    denominators (MASE); in pooled multi-model scopes equal codes are NOT
-    contiguous under this ordering, and consumers must not assume they are.
+    Pairs are sorted by (series_id, target) — the metric protocol's
+    documented input order — with (model_id, model_version) breaking ties in
+    pooled scopes, so the same scope always yields bit-identical results on
+    both the summary and raw paths and never inherits a backend's incidental
+    row order. Trajectory codes identify each (model, version, series)
+    trajectory for lag-based denominators (MASE); in pooled multi-model
+    scopes equal codes are NOT contiguous under this ordering, and consumers
+    must not assume they are.
     """
     if pairs.empty:
         return None, 0
-    ordered = pairs.sort_values(["series_id", "target"], kind="mergesort")
+    ordered = pairs.sort_values(
+        ["series_id", "target", "model_id", "model_version"], kind="mergesort"
+    )
     forecast = ordered["value"].to_numpy(dtype="float64")
     actual = ordered["actual_value"].to_numpy(dtype="float64")
     codes = pd.MultiIndex.from_frame(ordered[_TRAJECTORY_KEYS]).factorize()[0].astype("float64")
