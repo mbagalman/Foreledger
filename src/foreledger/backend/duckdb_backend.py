@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import threading
 import uuid
 from collections.abc import Sequence
 from pathlib import Path
@@ -70,13 +71,15 @@ class DuckDBBackend(Backend):
         ):
             directory.mkdir(parents=True, exist_ok=True)
         self._conn: duckdb.DuckDBPyConnection | None = None
+        self._conn_lock = threading.Lock()
 
     # -- internals ---------------------------------------------------------
 
     def _connection(self) -> duckdb.DuckDBPyConnection:
-        if self._conn is None:
-            self._conn = duckdb.connect(":memory:")
-        return self._conn
+        with self._conn_lock:
+            if self._conn is None:
+                self._conn = duckdb.connect(":memory:")
+            return self._conn
 
     @staticmethod
     def _files(directory: Path) -> list[str]:
@@ -113,7 +116,13 @@ class DuckDBBackend(Backend):
         DuckDBBackend._atomic_write_bytes(DuckDBBackend._to_parquet_bytes(frame), path)
 
     def _query(self, sql: str, params: list[Any]) -> pd.DataFrame:
-        return self._connection().execute(sql, params).df()
+        # One cursor per call: result state lives on the cursor, so concurrent
+        # reads on one archive handle can never clobber each other's results.
+        cursor = self._connection().cursor()
+        try:
+            return cursor.execute(sql, params).df()
+        finally:
+            cursor.close()
 
     # -- writes --------------------------------------------------------------
 

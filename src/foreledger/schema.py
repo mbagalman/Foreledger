@@ -112,6 +112,11 @@ def to_timestamp(value: Any, field: str) -> pd.Timestamp:
         raise ValidationError(f"{field} value {value!r} is not datetime-like") from exc
     if pd.isna(ts):
         raise ValidationError(f"{field} value is missing (NaT)")
+    if ts.tz is not None:
+        # match column normalization (normalize_datetimes): the archive is
+        # tz-naive, so a tz-aware scalar drops its zone keeping local wall
+        # time — otherwise it would crash naive-vs-aware arithmetic later
+        ts = ts.tz_localize(None)
     return ts
 
 

@@ -83,6 +83,27 @@ def test_handle_sees_overwrites_from_other_handle(store: Path) -> None:
     assert after.value == fresh.value
 
 
+def test_concurrent_raw_reads_on_one_handle(store: Path) -> None:
+    """Review reproduction: raw queries shared one lazily-created DuckDB
+    connection, whose result state concurrent calls overwrote — a stress test
+    failed 511 of 600 reads. Each query now runs on its own cursor, so
+    threaded reads on ONE archive handle must all return the committed state."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    import pandas as pd
+
+    ForecastArchive(store).ingest(forecast_frame(1.0), model_id="alpha", model_version="v1")
+    expected = ForecastArchive(store).as_of("2100-01-01")
+
+    shared = ForecastArchive(store)  # connection is created under the race too
+
+    def read(_: int) -> None:
+        pd.testing.assert_frame_equal(shared.as_of("2100-01-01"), expected)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(read, range(80)))  # map re-raises any worker failure
+
+
 def test_concurrent_initialization_of_a_new_store(store: Path) -> None:
     """Constructors racing on an empty path must all succeed (serialized
     init), never tripping over each other's temp files or the lock file."""

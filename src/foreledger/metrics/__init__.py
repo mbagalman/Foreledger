@@ -14,9 +14,11 @@ in-process with the caller's privileges.
 
 MASE note: the denominator is the in-window naive (lag-1) absolute error of
 the actuals, computed over the aligned pairs in target order. When a scope
-pools multiple series, differences are taken within each series (boundaries
-excluded). Pairs are the evaluation window, not a training set — scope MASE
-per series/period for the textbook reading.
+pools multiple series — or multiple models/versions, which repeat each
+series' actuals once per model — differences are taken within each
+(model, version, series) trajectory (boundaries excluded), so duplicated
+actuals never enter the denominator. Pairs are the evaluation window, not a
+training set — scope MASE per series/period for the textbook reading.
 """
 
 from __future__ import annotations
@@ -77,10 +79,11 @@ def _mase_denominator(actual: FloatArray, series_breaks: FloatArray | None) -> f
 
 
 def make_mase(series_breaks: FloatArray | None = None) -> MetricFn:
-    """Build a MASE metric, optionally aware of series boundaries.
+    """Build a MASE metric, optionally aware of trajectory boundaries.
 
-    ``series_breaks`` is a per-pair series code array used to exclude
-    cross-series differences from the naive-error denominator.
+    ``series_breaks`` is a per-pair trajectory code array (one code per
+    (model, version, series) trajectory) used to exclude cross-trajectory
+    differences from the naive-error denominator.
     """
 
     def mase(forecast: FloatArray, actual: FloatArray) -> float:

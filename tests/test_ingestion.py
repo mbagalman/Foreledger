@@ -197,6 +197,24 @@ def test_scalar_origin_kwarg(archive: ForecastArchive) -> None:
     assert total_rows(archive) == len(one_run)
 
 
+def test_timezone_aware_scalar_origin_is_normalized(archive: ForecastArchive) -> None:
+    """Review reproduction: column datetimes strip their timezone, but a
+    tz-aware SCALAR origin kept it — horizon derivation then crashed with an
+    untyped naive-vs-aware TypeError. Scalars must normalize the same way."""
+    frame = pd.DataFrame(
+        {
+            "series_id": ["S1"],
+            "target": pd.to_datetime(["2026-01-02"]),
+            "value": [1.0],
+        }
+    )
+    archive.ingest(frame, model_id="alpha", model_version="v1", origin="2026-01-01T00:00:00Z")
+    rows = archive.as_of("2100-01-01T00:00:00Z")  # tz-aware cutoff works too
+    assert len(rows) == 1
+    assert rows["origin"].iloc[0] == pd.Timestamp("2026-01-01")
+    assert rows["horizon"].iloc[0] == 1
+
+
 def test_identity_is_caller_supplied_and_validated(archive: ForecastArchive) -> None:
     frame = forecast_frame(1.0)
     with pytest.raises(ValidationError):
@@ -226,6 +244,21 @@ def test_non_finite_forecast_values_rejected(archive: ForecastArchive, bad_value
     frame.loc[0, "value"] = bad_value
     with pytest.raises(ValidationError):
         archive.ingest(frame, model_id="alpha", model_version="v1")
+
+
+def test_non_numeric_values_raise_the_typed_error(archive: ForecastArchive) -> None:
+    """Review reproduction: pd.to_numeric's ValueError leaked past the public
+    ValidationError contract for non-numeric forecast and actual values."""
+    frame = forecast_frame(1.0, origins=ORIGINS[:1], series=["S1"], horizons=[1])
+    frame["value"] = "not-a-number"
+    with pytest.raises(ValidationError, match="non-numeric"):
+        archive.ingest(frame, model_id="alpha", model_version="v1")
+
+    actuals = pd.DataFrame(
+        {"series_id": ["S1"], "target": pd.to_datetime(["2026-01-02"]), "value": ["oops"]}
+    )
+    with pytest.raises(ValidationError, match="non-numeric"):
+        archive.register_actuals(actuals)
 
 
 def test_content_hash_payload_is_pinned() -> None:

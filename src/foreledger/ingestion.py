@@ -92,7 +92,7 @@ def load_manifest_entries(path: Path) -> list[dict[str, Any]]:
         entries = payload.get("runs", [])
         if not isinstance(entries, list):
             raise TypeError("runs is not a list")
-    except (json.JSONDecodeError, TypeError, AttributeError) as exc:
+    except (json.JSONDecodeError, UnicodeDecodeError, TypeError, AttributeError) as exc:
         raise StoreFormatError(f"run manifest at {path} is unreadable or corrupt") from exc
     return entries
 
@@ -218,7 +218,10 @@ def validate_series_ids(raw: pd.Series, frame_kind: str) -> pd.Series:
 def validate_finite_values(raw: pd.Series, frame_kind: str) -> pd.Series:
     """Coerce values to float64 and reject NaN/±inf — non-finite numbers in
     the raw archive would poison every downstream metric."""
-    numeric = pd.to_numeric(raw, errors="raise").astype("float64")
+    try:
+        numeric = pd.to_numeric(raw, errors="raise").astype("float64")
+    except (ValueError, TypeError) as exc:
+        raise ValidationError(f"{frame_kind} value column contains non-numeric values") from exc
     if not np.isfinite(numeric.to_numpy()).all():
         raise ValidationError(
             f"{frame_kind} value column contains missing or non-finite values (NaN/inf)"

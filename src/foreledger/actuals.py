@@ -125,7 +125,7 @@ class ActualsManifest:
             )
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise StoreFormatError(f"actuals manifest at {path} is unreadable or corrupt") from exc
         return cls(
             path=path,

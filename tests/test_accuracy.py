@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -170,6 +171,28 @@ def test_builtin_metrics_all_compute(populated: ForecastArchive) -> None:
         )
         assert result.status == "ok", metric
         assert result.value is not None and result.value > 0
+
+
+def test_pooled_multi_model_mase_matches_per_model(store: Path) -> None:
+    """Review reproduction: a scope pooling several models repeats each
+    (series, target) actual once per model. The MASE denominator factorized
+    only series_id, so it walked those duplicates (including zero diffs
+    between identical actuals) and inflated pooled MASE — two identical
+    models scored 3x their individual value. The naive trajectory must be
+    partitioned per (model, version, series)."""
+    from tests.conftest import actuals_frame, forecast_frame
+
+    archive = ForecastArchive(store)
+    frame = forecast_frame(1.0)
+    archive.ingest(frame, model_id="twin-a", model_version="v1")
+    archive.ingest(frame, model_id="twin-b", model_version="v1")
+    archive.register_actuals(actuals_frame())
+
+    scoped = archive.accuracy_at_horizon(1, metric="MASE", model_id="twin-a", model_version="v1")
+    pooled = archive.accuracy_at_horizon(1, metric="MASE")  # all models, raw path
+    assert scoped.status == "ok" and scoped.value is not None
+    assert pooled.served_from == "raw"
+    assert pooled.value == pytest.approx(scoped.value, rel=1e-12)
 
 
 def test_query_inputs_are_validated(populated: ForecastArchive) -> None:

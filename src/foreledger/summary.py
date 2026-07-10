@@ -23,21 +23,30 @@ from .schema import ALL_PERIOD, ALL_SERIES, SUMMARY_COLUMNS, empty_summary
 logger = logging.getLogger("foreledger.summary")
 
 
+#: The columns that delimit one actual trajectory within a scope. A pooled
+#: scope (multiple models or versions) repeats each (series_id, target)
+#: actual once per model, so a trajectory keyed on series alone would walk
+#: duplicate actuals and corrupt lag-based denominators (MASE).
+_TRAJECTORY_KEYS = ["model_id", "model_version", "series_id"]
+
+
 def metric_over_pairs(
     registry: MetricRegistry, metric: str, pairs: pd.DataFrame
 ) -> tuple[float | None, int]:
     """Evaluate one metric over aligned forecast/actual pairs.
 
-    Pairs are sorted by (series_id, target) deterministically so the same
-    scope always yields bit-identical results on both the summary and raw
-    paths.
+    Pairs are sorted by (model_id, model_version, series_id, target)
+    deterministically so the same scope always yields bit-identical results
+    on both the summary and raw paths. (Summary cells hold a single
+    model/version, so for them this is the same (series_id, target) order as
+    ever; the model keys only matter for pooled raw scopes.)
     """
     if pairs.empty:
         return None, 0
-    ordered = pairs.sort_values(["series_id", "target"], kind="mergesort")
+    ordered = pairs.sort_values([*_TRAJECTORY_KEYS, "target"], kind="mergesort")
     forecast = ordered["value"].to_numpy(dtype="float64")
     actual = ordered["actual_value"].to_numpy(dtype="float64")
-    codes = pd.factorize(ordered["series_id"])[0].astype("float64")
+    codes = pd.MultiIndex.from_frame(ordered[_TRAJECTORY_KEYS]).factorize()[0].astype("float64")
     return registry.evaluate(metric, forecast, actual, codes), len(ordered)
 
 

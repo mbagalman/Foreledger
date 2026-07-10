@@ -85,7 +85,7 @@ class SegmentIntegrity:
                 isinstance(slot, dict) for slot in manifests.values()
             ):
                 raise TypeError("malformed manifests mapping")
-        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        except (json.JSONDecodeError, UnicodeDecodeError, KeyError, TypeError) as exc:
             raise StoreFormatError(
                 f"segment integrity registry at {path} is unreadable or corrupt"
             ) from exc

@@ -83,6 +83,23 @@ def test_invalid_utf8_champions_is_a_typed_error(store: Path) -> None:
         archive.champions()
 
 
+@pytest.mark.parametrize(
+    "filename", ["runs.json", "actuals_manifest.json", "segment_integrity.json"]
+)
+def test_invalid_utf8_mandatory_metadata_is_a_typed_error(store: Path, filename: str) -> None:
+    """Review reproduction: the mandatory format-3 metadata loaders caught
+    JSONDecodeError but not UnicodeDecodeError (a ValueError sibling, not a
+    subclass), so invalid UTF-8 bytes leaked an untyped decode error past the
+    documented corruption contract."""
+    archive = ForecastArchive(store)
+    archive.ingest(forecast_frame(1.0), model_id="alpha", model_version="v1")
+    archive.register_actuals(actuals_frame())
+    (store / filename).write_bytes(b"\xff\xfe\x00\x01")
+    with pytest.raises(StoreFormatError):
+        reopened = ForecastArchive(store)
+        reopened.accuracy_at_horizon(1, model_id="alpha", model_version="v1")
+
+
 def test_archive_persists_across_reopen(store: Path) -> None:
     first = ForecastArchive(store)
     first.ingest(forecast_frame(1.0), model_id="alpha", model_version="v1")
