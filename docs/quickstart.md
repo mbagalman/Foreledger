@@ -50,7 +50,8 @@ Three safety properties worth knowing from the start:
   and each commit lands atomically, so two jobs (or two archive handles)
   writing to the same store merge their runs instead of clobbering each
   other — and readers always see a committed state, never a half-written
-  one.
+  one. A single handle can also serve queries from multiple threads: each
+  query answers from one coherent snapshot on its own database cursor.
 
 ## 3. Ingest forecast runs
 
@@ -322,6 +323,11 @@ archive.register_metric("pinball90", pinball_p90, summarizable=True)
 print(archive.accuracy_at_horizon(1, metric="pinball90",
                                   model_id="prophet", model_version="2.1"))
 ```
+
+The arrays arrive in a documented, deterministic order — sorted by
+(series, target date), with ties in model-pooled scopes broken by
+(model, version) — so order-sensitive metrics give reproducible results on
+every query path and every backend.
 
 `summarizable=True` precomputes it alongside the built-ins. Registered
 metrics run behind an error/timeout guard: one that raises yields explicit

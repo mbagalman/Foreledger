@@ -216,8 +216,9 @@ def validate_series_ids(raw: pd.Series, frame_kind: str) -> pd.Series:
 
 
 def validate_finite_values(raw: pd.Series, frame_kind: str) -> pd.Series:
-    """Coerce values to float64 and reject NaN/±inf — non-finite numbers in
-    the raw archive would poison every downstream metric."""
+    """Coerce values to float64; reject non-numeric values and NaN/±inf —
+    both as :class:`ValidationError` — since non-finite numbers in the raw
+    archive would poison every downstream metric."""
     try:
         numeric = pd.to_numeric(raw, errors="raise").astype("float64")
     except (ValueError, TypeError) as exc:

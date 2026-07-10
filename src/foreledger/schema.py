@@ -95,11 +95,13 @@ SUMMARY_DTYPES: dict[str, str] = {
 
 
 def to_timestamp(value: Any, field: str) -> pd.Timestamp:
-    """Coerce a user-supplied origin/target to a pandas Timestamp.
+    """Coerce a user-supplied origin/target to a naive pandas Timestamp.
 
     Bare numbers are rejected: pandas would silently read them as epoch
     nanoseconds, so ``as_of(20260601)`` would become a 1970 date instead of
-    the obviously intended calendar day.
+    the obviously intended calendar day. Timezone-aware values drop their
+    zone keeping local wall time, exactly like column normalization
+    (:func:`foreledger.ingestion.normalize_datetimes`).
     """
     if isinstance(value, (bool, int, float, np.integer, np.floating)):
         raise ValidationError(
