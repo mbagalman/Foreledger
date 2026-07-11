@@ -55,7 +55,7 @@ that quietly reads as perfect accuracy.
 ## Quick start
 
 ```bash
-pip install -e .            # PyPI release coming with v0.1
+pip install foreledger
 python examples/quickstart.py   # full demo on synthetic data, zero config
 ```
 
@@ -150,9 +150,9 @@ python examples/quickstart.py
 
 Working MVP (Phases 1–4 of the
 [plan](https://github.com/mbagalman/Foreledger/blob/main/docs/internal/implementation-plan-forecast-archive.md)):
-the full ingestion → actuals → evaluation surface described above, gated by CI.
-Next: packaging and PyPI release (Phase 5), then the Snowflake warehouse
-backend as v1.1 (Phase 6).
+the full ingestion → actuals → evaluation surface described above, gated by CI
+and released on PyPI as v0.1 (Phase 5). Next: the Snowflake warehouse backend
+as v1.1 (Phase 6).
 
 ## License
 

@@ -32,7 +32,7 @@ from .ingestion import IngestResult
 from .results import AccuracyCurve, AccuracyResult
 from .schema import FORMAT_VERSION
 
-__version__ = "0.1.0.dev0"
+__version__ = "0.1.0"
 
 __all__ = [
     "FORMAT_VERSION",

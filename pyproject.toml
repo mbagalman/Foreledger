@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "foreledger"
-version = "0.1.0.dev0"
+version = "0.1.0"
 description = "Foreledger — a durable archive of recurring forecast runs with horizon-keyed accuracy evaluation, cross-model/version comparison, and origin-scoped as-of queries."
 readme = "README.md"
 license = "MIT"

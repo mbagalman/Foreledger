@@ -12,10 +12,11 @@ For the elevator pitch and architecture overview, see the [README](../README.md)
 Foreledger needs Python ≥ 3.11.
 
 ```bash
-git clone https://github.com/mbagalman/Foreledger.git
-cd Foreledger
-pip install -e .
+pip install foreledger
 ```
+
+(Working from a clone instead? `pip install -e .` from the repo root does the
+same.)
 
 Prefer to see it run before reading on? `python examples/quickstart.py`
 builds a synthetic two-model archive and renders the accuracy curves.
